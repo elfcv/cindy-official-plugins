@@ -1,4 +1,4 @@
-# QQ Mail attachments (0.2.9)
+# QQ Mail attachments (0.2.10)
 
 [简体中文](README.zh-CN.md)
 
@@ -95,11 +95,11 @@ This follows the repository's existing executor authorization contract; it does
 not claim to eliminate prompt injection. Any stronger Host-verified file approval
 requires an explicit maintainer design decision and validation.
 
-Version 0.2.9 reads attachments in chunks of at most 64 KiB while retaining the
+Version 0.2.10 reads attachments in chunks of at most 64 KiB while retaining the
 32 MiB aggregate limit, including growth after stat. Write failures are classified
 by execution stage: before a remote write, `not_executed` with a fixable reason;
 once a remote write starts without acknowledgement, `unknown`; after a successful
 write followed by confirmation/cleanup failure, `executed`. Unknown and executed
-failures require checking the mailbox before another write. The 0.2.9 package
+failures require checking the mailbox before another write. The 0.2.10 package
 has not yet completed Cindy device verification; earlier device results above
 apply to earlier package contents.
