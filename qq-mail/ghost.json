@@ -1,10 +1,10 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "id": "qq-mail",
   "name": "QQ 邮箱",
   "description": "通过 QQ 邮箱 IMAP/SMTP 搜索、阅读、整理邮件，并创建草稿或发送邮件。授权码由 Cindy 安全保存，仅在执行邮箱请求时临时提供给插件 Worker。",
   "whenToUse": "需要查找、阅读或整理 QQ 邮箱邮件，以及创建草稿或发送邮件时使用。首次使用前请在插件详情页输入 QQ 邮箱地址和 IMAP/SMTP 授权码并完成连接测试。",
-  "version": "0.2.3",
+  "version": "0.2.7",
   "locales": {
     "en": "locales/en.json",
     "zh-CN": "locales/zh-CN.json",
@@ -15,10 +15,6 @@
   "icon": "assets/icon.png",
   "entry": "main.js",
   "settingsHtml": "settings.html",
-  "slots": [
-    "tool",
-    "node"
-  ],
   "node": {
     "entry": "node/worker.cjs",
     "protocol": "json-rpc-stdio",
@@ -45,7 +41,7 @@
     },
     {
       "name": "qq_mail",
-      "description": "执行 QQ 邮箱操作：列文件夹、搜索、阅读、发送、保存草稿、标记已读/未读或移动邮件。每次操作临时建立 IMAP/SMTP 连接并在完成后断开；发送、移动和修改已读状态必须来自用户的明确要求。",
+      "description": "执行 QQ 邮箱 IMAP/SMTP 查询及邮件操作。send/draft 的 attachment_paths 仅接收明确授权的本机绝对路径，最多 10 个、合计 32 MiB；Worker 读取指定普通文件，经 smtp.qq.com 发送或 imap.qq.com 保存草稿，不修改源文件。send/draft/read 返回附件名称、字节数与 SHA-256；read 不下载附件。勿用顶层 dir/attachments。发送与修改须有用户明确要求；结果不确定时先核对邮箱，禁止盲目重试。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -114,12 +110,37 @@
           "max_results": {
             "type": "integer",
             "description": "search 返回条数，默认 10，最大 20。"
+          },
+          "attachment_paths": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "type": "string"
+            },
+            "description": "send/draft 的附件绝对路径列表，文件必须位于运行 Cindy 的电脑上；最多 10 个、合计 32 MiB，仅使用用户明确授权发送的文件。不传文件字节或 URL。"
           }
         },
         "required": [
           "action"
         ]
       }
+    },
+    {
+      "name": "qq_mail_connect",
+      "description": "使用 Cindy 已保存的 IMAP/SMTP 授权码连接指定 QQ 邮箱，验证 imap.qq.com 和 smtp.qq.com 后保存邮箱地址。用于用户完成保密输入后补全或恢复连接。只传邮箱地址，绝不传授权码；不发送邮件。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "要连接的 QQ 邮箱地址"
+          }
+        },
+        "required": [
+          "email"
+        ]
+      }
     }
-  ]
+  ],
+  "minCindyVersion": "0.1.92"
 }

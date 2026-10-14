@@ -7,7 +7,10 @@
       "description": "查询 QQ 邮箱是否已配置。只返回邮箱地址和连接状态，不返回授权码。"
     },
     "qq_mail": {
-      "description": "执行 QQ 邮箱操作：列文件夹、搜索、阅读、发送、保存草稿、标记已读/未读或移动邮件。每次操作临时建立 IMAP/SMTP 连接并在完成后断开；发送、移动和修改已读状态必须来自用户的明确要求。"
+      "description": "执行 QQ 邮箱 IMAP/SMTP 查询及邮件操作。send/draft 的 attachment_paths 仅接收明确授权的本机绝对路径，最多 10 个、合计 32 MiB；Worker 读取指定普通文件，经 smtp.qq.com 发送或 imap.qq.com 保存草稿，不修改源文件。send/draft/read 返回附件名称、字节数与 SHA-256；read 不下载附件。勿用顶层 dir/attachments。发送与修改须有用户明确要求；结果不确定时先核对邮箱，禁止盲目重试。"
+    },
+    "qq_mail_connect": {
+      "description": "使用 Cindy 已保存的 IMAP/SMTP 授权码连接指定 QQ 邮箱，验证 imap.qq.com 和 smtp.qq.com 后保存邮箱地址。用于用户完成保密输入后补全或恢复连接。只传邮箱地址，绝不传授权码；不发送邮件。"
     }
   }
 }

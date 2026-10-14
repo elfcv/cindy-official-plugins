@@ -66098,6 +66098,10 @@ var require_worker = __commonJS({
   "src/worker.cjs"(exports2, module2) {
     "use strict";
     var readline = require("node:readline");
+    var fs = require("node:fs/promises");
+    var { constants: fsConstants } = require("node:fs");
+    var path = require("node:path");
+    var { createHash } = require("node:crypto");
     var { ImapFlow } = require_imap_flow();
     var nodemailer = require_nodemailer();
     var { simpleParser } = require_mailparser();
@@ -66107,8 +66111,10 @@ var require_worker = __commonJS({
       smtpHost: "smtp.qq.com",
       smtpPort: 465
     });
+    var MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+    var MAX_ATTACHMENTS = 10;
     var MAX_BODY_CHARS = 2e4;
-    var MAX_SOURCE_BYTES = 12 * 1024 * 1024;
+    var MAX_SOURCE_BYTES = 48 * 1024 * 1024;
     var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     var SECRET_KEY = "qq_mail_authorization_code";
     function normalizeCredentials(value) {
@@ -66368,7 +66374,8 @@ var require_worker = __commonJS({
           attachments: Array.isArray(parsed.attachments) ? parsed.attachments.map((attachment) => ({
             filename: attachment.filename || null,
             content_type: attachment.contentType || null,
-            size: Number.isFinite(attachment.size) ? attachment.size : null
+            size: Number.isFinite(attachment.size) ? attachment.size : null,
+            sha256: Buffer.isBuffer(attachment.content) ? createHash("sha256").update(attachment.content).digest("hex") : null
           })) : []
         };
       }));
@@ -66395,12 +66402,61 @@ var require_worker = __commonJS({
         disableUrlAccess: true
       };
     }
+    async function prepareMailOptions(credentials, action) {
+      const options = mailOptions(credentials, action);
+      if (action.attachment_paths === void 0) return options;
+      const paths = action.attachment_paths;
+      if (!Array.isArray(paths) || paths.length > MAX_ATTACHMENTS || paths.some((file) => typeof file !== "string" || !path.isAbsolute(file) || /[\r\n\0]/.test(file))) {
+        throw new Error("INVALID_ATTACHMENT_PATHS");
+      }
+      let total = 0;
+      const attachments = [];
+      for (const file of paths) {
+        let handle;
+        try {
+          handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK || 0));
+          const stat = await handle.stat();
+          if (!stat.isFile()) throw new Error("ATTACHMENT_NOT_FILE");
+          const remaining = MAX_ATTACHMENT_BYTES - total;
+          if (stat.size > remaining) throw new Error("ATTACHMENTS_TOO_LARGE");
+          const buffer = Buffer.alloc(remaining + 1);
+          let length = 0;
+          while (length < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+            if (bytesRead === 0) break;
+            length += bytesRead;
+          }
+          if (length > remaining) throw new Error("ATTACHMENTS_TOO_LARGE");
+          const content = Buffer.from(buffer.subarray(0, length));
+          total += length;
+          attachments.push({ filename: path.basename(file), content });
+        } catch (error) {
+          if (["ENOENT", "EACCES", "EPERM", "EISDIR"].includes(error.code)) {
+            throw new Error("ATTACHMENT_UNREADABLE");
+          }
+          throw error;
+        } finally {
+          if (handle) await handle.close();
+        }
+      }
+      if (attachments.length) options.attachments = attachments;
+      return options;
+    }
+    function attachmentSummary(options) {
+      return (options.attachments || []).map(({ filename, content }) => ({
+        filename,
+        size: content.length,
+        sha256: createHash("sha256").update(content).digest("hex")
+      }));
+    }
     async function sendMessage(credentials, action, deps) {
+      const options = await prepareMailOptions(credentials, action);
       const transporter = deps.createSmtp(credentials);
       try {
-        const info = await transporter.sendMail(mailOptions(credentials, action));
+        const info = await transporter.sendMail(options);
         return {
           sent: true,
+          attachments: attachmentSummary(options),
           message_id: info.messageId || null,
           accepted: Array.isArray(info.accepted) ? info.accepted.map(String) : [],
           rejected: Array.isArray(info.rejected) ? info.rejected.map(String) : []
@@ -66418,15 +66474,17 @@ var require_worker = __commonJS({
       throw new Error("DRAFT_FOLDER_NOT_FOUND");
     }
     async function saveDraft(credentials, action, deps) {
+      const options = await prepareMailOptions(credentials, action);
       const composer = deps.createComposer();
       try {
-        const info = await composer.sendMail(mailOptions(credentials, action));
+        const info = await composer.sendMail(options);
         if (!info || !Buffer.isBuffer(info.message)) throw new Error("DRAFT_BUILD_FAILED");
         return withImap(credentials, deps, async (client) => {
           const folder = await findDraftFolder(client);
           const appended = await client.append(folder, info.message, ["\\Draft"], /* @__PURE__ */ new Date());
           return {
             draft: true,
+            attachments: attachmentSummary(options),
             folder,
             uid: appended && appended.uid ? appended.uid : null,
             uid_validity: appended && appended.uidValidity ? String(appended.uidValidity) : null
@@ -66528,6 +66586,9 @@ var require_worker = __commonJS({
       const code = error && error.code ? String(error.code) : "";
       const message = error && error.message ? String(error.message) : String(error || "");
       const combined = `${code} ${message}`.toLowerCase();
+      if (message === "INVALID_ATTACHMENT_PATHS") return "\u9644\u4EF6\u987B\u4F7F\u7528\u672C\u673A\u6587\u4EF6\u7EDD\u5BF9\u8DEF\u5F84\u5217\u8868\uFF0C\u6BCF\u5C01\u6700\u591A 10 \u4E2A\u6587\u4EF6";
+      if (message === "ATTACHMENT_UNREADABLE" || message === "ATTACHMENT_NOT_FILE") return "\u9644\u4EF6\u4E0D\u5B58\u5728\u3001\u65E0\u6CD5\u8BFB\u53D6\u6216\u4E0D\u662F\u666E\u901A\u6587\u4EF6\uFF1B\u90AE\u4EF6\u672A\u53D1\u9001\uFF0C\u8BF7\u68C0\u67E5\u6587\u4EF6\u8DEF\u5F84";
+      if (message === "ATTACHMENTS_TOO_LARGE") return "\u9644\u4EF6\u603B\u5927\u5C0F\u8D85\u8FC7 32 MiB\uFF1B\u90AE\u4EF6\u672A\u53D1\u9001\uFF0C\u8BF7\u7F29\u5C0F\u9644\u4EF6\u540E\u91CD\u8BD5";
       if (message === "INVALID_EMAIL") return "\u8BF7\u8F93\u5165\u6709\u6548\u7684 QQ \u90AE\u7BB1\u5730\u5740";
       if (message === "INVALID_AUTHORIZATION_CODE") {
         return "\u8BF7\u8F93\u5165 QQ \u90AE\u7BB1\u751F\u6210\u7684 IMAP/SMTP \u6388\u6743\u7801\uFF0C\u4E0D\u8981\u8F93\u5165 QQ \u5BC6\u7801";
@@ -66583,7 +66644,27 @@ var require_worker = __commonJS({
         }
         throw new Error("METHOD_NOT_FOUND");
       } catch (error) {
-        throw new Error(humanizeError(error));
+        const action = params.action && params.action.action;
+        const mutation = request.method === "mail/action" && ["send", "draft", "move", "mark_read", "mark_unread"].includes(action);
+        const rejectedInput = [
+          "INVALID_EMAIL",
+          "INVALID_AUTHORIZATION_CODE",
+          "INVALID_ATTACHMENT_PATHS",
+          "ATTACHMENT_UNREADABLE",
+          "ATTACHMENT_NOT_FILE",
+          "ATTACHMENTS_TOO_LARGE",
+          "RECIPIENT_REQUIRED",
+          "INVALID_RECIPIENT",
+          "INVALID_SUBJECT",
+          "INVALID_BODY",
+          "TARGET_FOLDER_REQUIRED",
+          "TARGET_FOLDER_SAME",
+          "DRAFT_FOLDER_NOT_FOUND"
+        ].includes(error && error.message);
+        const state = mutation ? rejectedInput ? "not_executed" : "unknown" : void 0;
+        const failure = new Error(state === "unknown" ? "\u64CD\u4F5C\u7ED3\u679C\u4E0D\u786E\u5B9A\uFF0C\u8BF7\u5148\u6838\u5BF9\u6536\u4EF6\u7BB1\u3001\u5DF2\u53D1\u9001\u3001\u8349\u7A3F\u6216\u76EE\u6807\u6587\u4EF6\u5939\u7684\u5B9E\u9645\u72B6\u6001\uFF0C\u907F\u514D\u91CD\u590D\u64CD\u4F5C" : (state === "not_executed" ? "\u64CD\u4F5C\u672A\u6267\u884C\uFF1A" : "") + humanizeError(error));
+        failure.executionState = state;
+        throw failure;
       } finally {
         if (credentials) credentials.authorizationCode = "";
       }
@@ -66613,7 +66694,8 @@ var require_worker = __commonJS({
             id: request.id,
             error: {
               code: -32e3,
-              message: error && error.message ? error.message : "QQ \u90AE\u7BB1\u64CD\u4F5C\u5931\u8D25"
+              message: error && error.message ? error.message : "QQ \u90AE\u7BB1\u64CD\u4F5C\u5931\u8D25",
+              ...error && error.executionState ? { data: { execution_state: error.executionState } } : {}
             }
           });
         });

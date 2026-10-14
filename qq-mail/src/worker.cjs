@@ -1,6 +1,10 @@
 'use strict';
 
 const readline = require('node:readline');
+const fs = require('node:fs/promises');
+const { constants: fsConstants } = require('node:fs');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { ImapFlow } = require('imapflow');
 const nodemailer = require('nodemailer');
 const { simpleParser } = require('mailparser');
@@ -12,8 +16,10 @@ const QQ = Object.freeze({
   smtpPort: 465,
 });
 
+const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+const MAX_ATTACHMENTS = 10;
 const MAX_BODY_CHARS = 20000;
-const MAX_SOURCE_BYTES = 12 * 1024 * 1024;
+const MAX_SOURCE_BYTES = 48 * 1024 * 1024;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SECRET_KEY = 'qq_mail_authorization_code';
 
@@ -319,6 +325,8 @@ async function readMessage(credentials, action, deps) {
             filename: attachment.filename || null,
             content_type: attachment.contentType || null,
             size: Number.isFinite(attachment.size) ? attachment.size : null,
+            sha256: Buffer.isBuffer(attachment.content)
+              ? createHash('sha256').update(attachment.content).digest('hex') : null,
           }))
         : [],
     };
@@ -348,12 +356,67 @@ function mailOptions(credentials, action) {
   };
 }
 
+// Only the explicitly supplied local paths are read. Attachment bytes never enter
+// Agent parameters or RPC; Nodemailer receives bounded buffers, not file/URL access.
+async function prepareMailOptions(credentials, action) {
+  const options = mailOptions(credentials, action);
+  if (action.attachment_paths === undefined) return options;
+  const paths = action.attachment_paths;
+  if (!Array.isArray(paths) || paths.length > MAX_ATTACHMENTS || paths.some(file =>
+    typeof file !== 'string' || !path.isAbsolute(file) || /[\r\n\0]/.test(file))) {
+    throw new Error('INVALID_ATTACHMENT_PATHS');
+  }
+  let total = 0;
+  const attachments = [];
+  for (const file of paths) {
+    let handle;
+    try {
+      // Nonblocking open lets the subsequent fstat reject FIFOs/devices safely.
+      handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK || 0));
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error('ATTACHMENT_NOT_FILE');
+      const remaining = MAX_ATTACHMENT_BYTES - total;
+      if (stat.size > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
+      // Bound the read even if another process grows the file after fstat.
+      const buffer = Buffer.alloc(remaining + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
+      const content = Buffer.from(buffer.subarray(0, length));
+      total += length;
+      attachments.push({ filename: path.basename(file), content });
+    } catch (error) {
+      if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR'].includes(error.code)) {
+        throw new Error('ATTACHMENT_UNREADABLE');
+      }
+      throw error;
+    } finally {
+      if (handle) await handle.close();
+    }
+  }
+  if (attachments.length) options.attachments = attachments;
+  return options;
+}
+
+function attachmentSummary(options) {
+  return (options.attachments || []).map(({ filename, content }) => ({
+    filename, size: content.length,
+    sha256: createHash('sha256').update(content).digest('hex'),
+  }));
+}
+
 async function sendMessage(credentials, action, deps) {
+  const options = await prepareMailOptions(credentials, action);
   const transporter = deps.createSmtp(credentials);
   try {
-    const info = await transporter.sendMail(mailOptions(credentials, action));
+    const info = await transporter.sendMail(options);
     return {
       sent: true,
+      attachments: attachmentSummary(options),
       message_id: info.messageId || null,
       accepted: Array.isArray(info.accepted) ? info.accepted.map(String) : [],
       rejected: Array.isArray(info.rejected) ? info.rejected.map(String) : [],
@@ -373,15 +436,17 @@ async function findDraftFolder(client) {
 }
 
 async function saveDraft(credentials, action, deps) {
+  const options = await prepareMailOptions(credentials, action);
   const composer = deps.createComposer();
   try {
-    const info = await composer.sendMail(mailOptions(credentials, action));
+    const info = await composer.sendMail(options);
     if (!info || !Buffer.isBuffer(info.message)) throw new Error('DRAFT_BUILD_FAILED');
     return withImap(credentials, deps, async (client) => {
       const folder = await findDraftFolder(client);
       const appended = await client.append(folder, info.message, ['\\Draft'], new Date());
       return {
         draft: true,
+        attachments: attachmentSummary(options),
         folder,
         uid: appended && appended.uid ? appended.uid : null,
         uid_validity: appended && appended.uidValidity ? String(appended.uidValidity) : null,
@@ -496,6 +561,9 @@ function humanizeError(error) {
   const message = error && error.message ? String(error.message) : String(error || '');
   const combined = `${code} ${message}`.toLowerCase();
 
+  if (message === 'INVALID_ATTACHMENT_PATHS') return '附件须使用本机文件绝对路径列表，每封最多 10 个文件';
+  if (message === 'ATTACHMENT_UNREADABLE' || message === 'ATTACHMENT_NOT_FILE') return '附件不存在、无法读取或不是普通文件；邮件未发送，请检查文件路径';
+  if (message === 'ATTACHMENTS_TOO_LARGE') return '附件总大小超过 32 MiB；邮件未发送，请缩小附件后重试';
   if (message === 'INVALID_EMAIL') return '请输入有效的 QQ 邮箱地址';
   if (message === 'INVALID_AUTHORIZATION_CODE') {
     return '请输入 QQ 邮箱生成的 IMAP/SMTP 授权码，不要输入 QQ 密码';
@@ -564,7 +632,23 @@ async function handleRequest(request, deps = createRuntimeDeps()) {
     }
     throw new Error('METHOD_NOT_FOUND');
   } catch (error) {
-    throw new Error(humanizeError(error));
+    const action = params.action && params.action.action;
+    const mutation = request.method === 'mail/action'
+      && ['send', 'draft', 'move', 'mark_read', 'mark_unread'].includes(action);
+    // These failures precede all remote mutation calls. Other failures are
+    // conservatively unknown: a lost response does not prove non-execution.
+    const rejectedInput = [
+      'INVALID_EMAIL', 'INVALID_AUTHORIZATION_CODE', 'INVALID_ATTACHMENT_PATHS',
+      'ATTACHMENT_UNREADABLE', 'ATTACHMENT_NOT_FILE', 'ATTACHMENTS_TOO_LARGE',
+      'RECIPIENT_REQUIRED', 'INVALID_RECIPIENT', 'INVALID_SUBJECT', 'INVALID_BODY',
+      'TARGET_FOLDER_REQUIRED', 'TARGET_FOLDER_SAME', 'DRAFT_FOLDER_NOT_FOUND',
+    ].includes(error && error.message);
+    const state = mutation ? (rejectedInput ? 'not_executed' : 'unknown') : undefined;
+    const failure = new Error(state === 'unknown'
+      ? '操作结果不确定，请先核对收件箱、已发送、草稿或目标文件夹的实际状态，避免重复操作'
+      : (state === 'not_executed' ? '操作未执行：' : '') + humanizeError(error));
+    failure.executionState = state;
+    throw failure;
   } finally {
     if (credentials) credentials.authorizationCode = '';
   }
@@ -598,6 +682,7 @@ function startStdio() {
           error: {
             code: -32000,
             message: error && error.message ? error.message : 'QQ 邮箱操作失败',
+            ...(error && error.executionState ? { data: { execution_state: error.executionState } } : {}),
           },
         });
       });
