@@ -220,6 +220,7 @@ async function runMail(args, callId) {
     return { ok: true, result: result };
   } catch (error) {
     if (['send', 'draft', 'move', 'mark_read', 'mark_unread'].includes(action.action)) {
+      if (error.executionState === 'executed') return fail(error.message);
       if (dispatched && error.executionState !== 'not_executed') {
         return fail('操作结果不确定，请先核对邮箱实际状态，避免重复发送或重复修改');
       }

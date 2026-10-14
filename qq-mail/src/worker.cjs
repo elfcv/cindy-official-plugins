@@ -378,19 +378,21 @@ async function prepareMailOptions(credentials, action) {
       const remaining = MAX_ATTACHMENT_BYTES - total;
       if (stat.size > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
       // Bound the read even if another process grows the file after fstat.
-      const buffer = Buffer.alloc(remaining + 1);
+      const buffer = Buffer.alloc(Math.min(64 * 1024, remaining + 1));
+      const chunks = [];
       let length = 0;
-      while (length < buffer.length) {
-        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+      while (true) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining - length + 1), null);
         if (bytesRead === 0) break;
         length += bytesRead;
+        if (length > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
+        chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
       }
-      if (length > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
-      const content = Buffer.from(buffer.subarray(0, length));
+      const content = Buffer.concat(chunks, length);
       total += length;
       attachments.push({ filename: path.basename(file), content });
     } catch (error) {
-      if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR'].includes(error.code)) {
+      if (['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EISDIR'].includes(error.code)) {
         throw new Error('ATTACHMENT_UNREADABLE');
       }
       throw error;
@@ -409,11 +411,13 @@ function attachmentSummary(options) {
   }));
 }
 
-async function sendMessage(credentials, action, deps) {
+async function sendMessage(credentials, action, deps, execution) {
   const options = await prepareMailOptions(credentials, action);
   const transporter = deps.createSmtp(credentials);
   try {
+    execution.state = 'unknown';
     const info = await transporter.sendMail(options);
+    execution.state = 'executed';
     return {
       sent: true,
       attachments: attachmentSummary(options),
@@ -435,15 +439,17 @@ async function findDraftFolder(client) {
   throw new Error('DRAFT_FOLDER_NOT_FOUND');
 }
 
-async function saveDraft(credentials, action, deps) {
+async function saveDraft(credentials, action, deps, execution) {
   const options = await prepareMailOptions(credentials, action);
   const composer = deps.createComposer();
   try {
     const info = await composer.sendMail(options);
     if (!info || !Buffer.isBuffer(info.message)) throw new Error('DRAFT_BUILD_FAILED');
-    return withImap(credentials, deps, async (client) => {
+    return await withImap(credentials, deps, async (client) => {
       const folder = await findDraftFolder(client);
+      execution.state = 'unknown';
       const appended = await client.append(folder, info.message, ['\\Draft'], new Date());
+      execution.state = 'executed';
       return {
         draft: true,
         attachments: attachmentSummary(options),
@@ -457,7 +463,7 @@ async function saveDraft(credentials, action, deps) {
   }
 }
 
-async function changeFlags(credentials, action, deps, seen) {
+async function changeFlags(credentials, action, deps, seen, execution) {
   const folder = action.folder || 'INBOX';
   return withImap(credentials, deps, (client) => withMailbox(client, folder, async () => {
     const existing = await client.fetchOne(
@@ -469,10 +475,12 @@ async function changeFlags(credentials, action, deps, seen) {
 
     const currentFlags = flagsArray(existing.flags);
     if (currentFlags.includes('\\Seen') !== seen) {
+      execution.state = 'unknown';
       const updated = seen
         ? await client.messageFlagsAdd(action.message_uid, ['\\Seen'], { uid: true })
         : await client.messageFlagsRemove(action.message_uid, ['\\Seen'], { uid: true });
       if (!updated) throw new Error('MESSAGE_NOT_FOUND');
+      execution.state = 'executed';
 
       const verified = await client.fetchOne(
         action.message_uid,
@@ -488,7 +496,7 @@ async function changeFlags(credentials, action, deps, seen) {
   }));
 }
 
-async function moveMessage(credentials, action, deps) {
+async function moveMessage(credentials, action, deps, execution) {
   const folder = action.folder || 'INBOX';
   const target = typeof action.target_folder === 'string' ? action.target_folder.trim() : '';
   if (!target) throw new Error('TARGET_FOLDER_REQUIRED');
@@ -501,8 +509,10 @@ async function moveMessage(credentials, action, deps) {
     );
     if (!existing) throw new Error('MESSAGE_NOT_FOUND');
 
+    execution.state = 'unknown';
     const moved = await client.messageMove(action.message_uid, target, { uid: true });
     if (!moved) throw new Error('MESSAGE_NOT_FOUND');
+    execution.state = 'executed';
     const destinationUid = moved.uidMap && moved.uidMap.get
       ? (moved.uidMap.get(action.message_uid) || null)
       : null;
@@ -533,7 +543,7 @@ async function testAccount(credentials, deps) {
   };
 }
 
-async function performAction(credentials, action, deps) {
+async function performAction(credentials, action, deps, execution = { state: 'not_executed' }) {
   switch (action.action) {
     case 'list_folders':
       return listFolders(credentials, deps);
@@ -542,15 +552,15 @@ async function performAction(credentials, action, deps) {
     case 'read':
       return readMessage(credentials, action, deps);
     case 'send':
-      return sendMessage(credentials, action, deps);
+      return sendMessage(credentials, action, deps, execution);
     case 'draft':
-      return saveDraft(credentials, action, deps);
+      return saveDraft(credentials, action, deps, execution);
     case 'mark_read':
-      return changeFlags(credentials, action, deps, true);
+      return changeFlags(credentials, action, deps, true, execution);
     case 'mark_unread':
-      return changeFlags(credentials, action, deps, false);
+      return changeFlags(credentials, action, deps, false, execution);
     case 'move':
-      return moveMessage(credentials, action, deps);
+      return moveMessage(credentials, action, deps, execution);
     default:
       throw new Error('UNKNOWN_ACTION');
   }
@@ -593,7 +603,8 @@ function humanizeError(error) {
     return 'QQ 邮箱暂时限制了频繁访问，请稍后再试';
   }
   if (message === 'MESSAGE_NOT_FOUND') return '没有在指定文件夹找到这封邮件，请重新搜索';
-  if (message === 'MESSAGE_TOO_LARGE') return '邮件内容过大，当前版本暂时无法处理';
+  if (message === 'MESSAGE_TOO_LARGE') return '邮件内容过大；发送或保存草稿时请将主题缩短至 998 字符以内、正文缩短至 500000 字符以内；读取邮件上限为 48 MiB';
+  if (message === 'DRAFT_BUILD_FAILED') return '草稿内容生成失败，请检查邮件内容后再保存';
   if (message === 'DRAFT_FOLDER_NOT_FOUND') {
     return '没有找到 QQ 邮箱草稿箱，请先调用 list_folders 确认服务器文件夹';
   }
@@ -619,6 +630,7 @@ async function handleRequest(request, deps = createRuntimeDeps()) {
   if (!request || typeof request !== 'object') throw new Error('INVALID_REQUEST');
   const params = request.params && typeof request.params === 'object' ? request.params : {};
   let credentials = null;
+  const execution = { state: 'not_executed' };
   try {
     if (request.method === 'account/connect') {
       credentials = consumeRequestCredentials(request);
@@ -628,25 +640,21 @@ async function handleRequest(request, deps = createRuntimeDeps()) {
     if (request.method === 'mail/action') {
       credentials = consumeRequestCredentials(request);
       const action = params.action && typeof params.action === 'object' ? params.action : {};
-      return await performAction(credentials, action, deps);
+      return await performAction(credentials, action, deps, execution);
     }
     throw new Error('METHOD_NOT_FOUND');
   } catch (error) {
     const action = params.action && params.action.action;
     const mutation = request.method === 'mail/action'
       && ['send', 'draft', 'move', 'mark_read', 'mark_unread'].includes(action);
-    // These failures precede all remote mutation calls. Other failures are
-    // conservatively unknown: a lost response does not prove non-execution.
-    const rejectedInput = [
-      'INVALID_EMAIL', 'INVALID_AUTHORIZATION_CODE', 'INVALID_ATTACHMENT_PATHS',
-      'ATTACHMENT_UNREADABLE', 'ATTACHMENT_NOT_FILE', 'ATTACHMENTS_TOO_LARGE',
-      'RECIPIENT_REQUIRED', 'INVALID_RECIPIENT', 'INVALID_SUBJECT', 'INVALID_BODY',
-      'TARGET_FOLDER_REQUIRED', 'TARGET_FOLDER_SAME', 'DRAFT_FOLDER_NOT_FOUND',
-    ].includes(error && error.message);
-    const state = mutation ? (rejectedInput ? 'not_executed' : 'unknown') : undefined;
+    // Only crossing a remote write boundary makes a failure ambiguous. Error
+    // names cannot establish whether SMTP/IMAP has already changed the mailbox.
+    const state = mutation ? execution.state : undefined;
     const failure = new Error(state === 'unknown'
       ? '操作结果不确定，请先核对收件箱、已发送、草稿或目标文件夹的实际状态，避免重复操作'
-      : (state === 'not_executed' ? '操作未执行：' : '') + humanizeError(error));
+      : state === 'executed'
+        ? '操作已执行，但后续确认或清理失败；请先核对邮箱实际状态，避免重复操作'
+        : (state === 'not_executed' ? '操作未执行：' : '') + humanizeError(error));
     failure.executionState = state;
     throw failure;
   } finally {

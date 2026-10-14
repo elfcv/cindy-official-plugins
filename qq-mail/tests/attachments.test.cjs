@@ -142,3 +142,118 @@ test('host timeouts on send are unknown and never invite blind retries', async (
   assert.match(response.message, /结果不确定/);
   assert.doesNotMatch(response.message, /请重试/);
 });
+
+const requestFor = action => ({ method: 'mail/action', params: { email: credentials.email, action }, cindy: { secrets: { qq_mail_authorization_code: 'dummy-test-code' } } });
+test('all mail preparation failures are not_executed with actionable reasons', async t => {
+  const { handleRequest } = require('../src/worker.cjs');
+  const dir = await fixture(t), file = path.join(dir, 'ordinary.txt');
+  await fs.writeFile(file, 'ordinary');
+  for (const action of ['send', 'draft']) {
+    for (const [extra, reason] of [
+      [{ subject: 'x'.repeat(999) }, /主题|内容/],
+      [{ body_text: 'x'.repeat(500001) }, /正文|内容/],
+      [{ attachment_paths: [path.join(file, 'child.txt')] }, /附件|路径/],
+    ]) {
+      await assert.rejects(handleRequest(requestFor({ ...base, action, ...extra }), {
+        createSmtp() { assert.fail('must not create SMTP'); },
+        createComposer() { assert.fail('must not compose invalid input'); },
+      }), error => {
+        assert.equal(error.executionState, 'not_executed');
+        assert.match(error.message, reason);
+        assert.doesNotMatch(error.message, /结果不确定/);
+        return true;
+      });
+    }
+  }
+});
+test('draft composition and connection failures precede remote append', async () => {
+  const { handleRequest } = require('../src/worker.cjs');
+  for (const deps of [
+    { createComposer: () => ({ sendMail: async () => { throw new Error('compose failed'); }, close() {} }) },
+    { createComposer: () => ({ sendMail: async () => ({ message: Buffer.from('draft') }), close() {} }),
+      createImap: () => ({ connect: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); }, close() {}, append() { assert.fail('must not append'); } }) },
+  ]) await assert.rejects(handleRequest(requestFor({ ...base, action: 'draft' }), deps), error => error.executionState === 'not_executed');
+});
+test('remote mutation failures stay unknown regardless of their error name', async () => {
+  const { handleRequest } = require('../src/worker.cjs');
+  const fail = async () => { throw new Error('MESSAGE_TOO_LARGE'); };
+  for (const action of ['send', 'draft']) {
+    const deps = { createSmtp: () => ({ sendMail: fail, close() {} }),
+      createComposer: () => ({ sendMail: async () => ({ message: Buffer.from('draft') }), close() {} }),
+      createImap: () => ({ connect: async () => {}, logout: async () => {}, list: async () => [{ path: 'Drafts', specialUse: '\\Drafts' }], append: fail }) };
+    await assert.rejects(handleRequest(requestFor({ ...base, action }), deps), error => {
+      assert.equal(error.executionState, 'unknown');
+      assert.match(error.message, /核对/);
+      return true;
+    });
+  }
+});
+test('successful send followed by cleanup failure reports executed', async () => {
+  const { handleRequest } = require('../src/worker.cjs');
+  await assert.rejects(handleRequest(requestFor(base), { createSmtp: () => ({
+    sendMail: async () => ({ accepted: ['test@example.test'] }), close() { throw new Error('close failed'); },
+  }) }), error => error.executionState === 'executed' && /已执行/.test(error.message));
+});
+test('ten tiny attachments use bounded scratch allocations', async t => {
+  const dir = await fixture(t), file = path.join(dir, 'tiny.txt');
+  await fs.writeFile(file, 'tiny');
+  const original = Buffer.alloc;
+  const allocations = [];
+  t.mock.method(Buffer, 'alloc', function (size, ...args) { allocations.push(size); return original(size, ...args); });
+  const result = await performAction(credentials, { ...base, attachment_paths: Array(10).fill(file) }, {
+    createSmtp: () => ({ sendMail: async () => ({}), close() {} }),
+  });
+  assert.equal(result.attachments.length, 10);
+  assert.ok(Math.max(...allocations) <= 64 * 1024, `largest allocation: ${Math.max(...allocations)}`);
+});
+test('files growing after stat are read completely or rejected at the total limit', async t => {
+  const dir = await fixture(t), file = path.join(dir, 'growing.bin');
+  const originalOpen = fs.open.bind(fs);
+  t.mock.method(fs, 'open', async (...args) => {
+    const handle = await originalOpen(...args), originalStat = handle.stat.bind(handle);
+    handle.stat = async () => Object.assign(await originalStat(), { size: 0 });
+    return handle;
+  });
+  await fs.writeFile(file, Buffer.alloc(100000, 0xab));
+  let received;
+  const deps = { createSmtp: () => ({ sendMail: async options => { received = options.attachments[0].content; return {}; }, close() {} }) };
+  await performAction(credentials, { ...base, attachment_paths: [file] }, deps);
+  assert.equal(received.length, 100000);
+  assert.equal(received[99999], 0xab);
+  await fs.truncate(file, 32 * 1024 * 1024 + 1);
+  await assert.rejects(performAction(credentials, { ...base, attachment_paths: [file] }, deps), /ATTACHMENTS_TOO_LARGE/);
+});
+test('draft cleanup runs after append and preserves its known result', async () => {
+  const { handleRequest } = require('../src/worker.cjs');
+  let appended = false;
+  await assert.rejects(handleRequest(requestFor({ ...base, action: 'draft' }), {
+    createComposer: () => ({ sendMail: async () => ({ message: Buffer.from('draft') }), close() { assert.equal(appended, true); throw new Error('cleanup failed'); } }),
+    createImap: () => ({ connect: async () => {}, logout: async () => {}, list: async () => [{ path: 'Drafts', specialUse: '\\Drafts' }],
+      append: async () => { await new Promise(resolve => setImmediate(resolve)); appended = true; return { uid: 1 }; } }),
+  }), error => error.executionState === 'executed');
+});
+test('main preserves known executed failures instead of suggesting another send', async () => {
+  let handler, response;
+  const context = { Map, setTimeout, fetch: async url => ({ ok: true, json: async () => url === '/kv' ? { email: credentials.email } : [{ key: 'qq_mail_authorization_code', saved: true }] }), cindy: {
+    onHostMessage: fn => { handler = fn; }, node: { request: async () => ({ ok: false, message: '操作已执行，请核对邮箱', data: { execution_state: 'executed' } }) }, send: async r => { response = r; },
+  } };
+  vm.runInNewContext(await fs.readFile(path.join(__dirname, '../main.js'), 'utf8'), context);
+  handler({ type: 'tool-call', tool: 'qq_mail', callId: 'completed-call', args: base });
+  for (let i = 0; i < 20 && !response; i++) await new Promise(r => setImmediate(r));
+  assert.equal(response.ok, false);
+  assert.equal(response.message, '操作已执行，请核对邮箱');
+});
+test('flag and move failures use the actual remote mutation stage', async () => {
+  const { handleRequest } = require('../src/worker.cjs');
+  for (const action of ['mark_read', 'mark_unread', 'move']) {
+    for (const phase of ['before', 'during', 'after']) {
+      const client = { connect: async () => {}, logout: async () => {}, getMailboxLock: async () => ({ release() {} }),
+        fetchOne: async () => { if (phase === 'before') throw new Error('fetch failed'); return { uid: 1, flags: action === 'mark_unread' ? new Set(['\\Seen']) : new Set() }; },
+        messageFlagsAdd: async () => { if (phase === 'during') throw new Error('INVALID_EMAIL'); return true; },
+        messageFlagsRemove: async () => { if (phase === 'during') throw new Error('INVALID_EMAIL'); return true; },
+        messageMove: async () => { if (phase === 'during') throw new Error('INVALID_EMAIL'); return { uidMap: new Map() }; } };
+      await assert.rejects(handleRequest(requestFor({ action, message_uid: 1, target_folder: 'Archive' }), { createImap: () => client }),
+        error => error.executionState === ({ before: 'not_executed', during: 'unknown', after: 'executed' })[phase]);
+    }
+  }
+});
