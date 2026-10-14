@@ -290,3 +290,37 @@ test('attachment open/stat/read/close errors stay in the local file error domain
     } finally { mock.mock.restore(); }
   }
 });
+
+test('a transient result-delivery failure preserves known outcomes without repeating mailbox operations', async () => {
+  for (const action of ['send', 'draft', 'move', 'mark_read', 'mark_unread']) {
+    for (const state of ['success', 'not_executed', 'executed', 'unknown', 'invalid']) {
+      let handler, delivered, calls = 0, deliveries = 0;
+      const args = { ...base, action, message_uid: 1, target_folder: 'Archive' };
+      if (state === 'invalid') { if (action === 'send' || action === 'draft') delete args.subject; else delete args.message_uid; }
+      const expectedMessage = state === 'not_executed' ? '操作未执行：附件路径错误' : '操作已执行，请核对邮箱';
+      const context = { Map, setTimeout, fetch: async url => ({ ok: true, json: async () => url === '/kv' ? { email: credentials.email } : [{ key: 'qq_mail_authorization_code', saved: true }] }), cindy: {
+        onHostMessage: fn => { handler = fn; }, node: { request: async () => {
+          calls++;
+          if (state === 'success') return { ok: true, result: { action, uid: 123 } };
+          if (state === 'unknown') return { ok: false, message: 'timeout' };
+          return { ok: false, message: expectedMessage, data: { execution_state: state } };
+        } }, send: async result => { if (++deliveries === 1) throw new Error('transient delivery failure'); delivered = result; },
+      } };
+      vm.runInNewContext(await fs.readFile(path.join(__dirname, '../main.js'), 'utf8'), context);
+      handler({ type: 'tool-call', tool: 'qq_mail', callId: 'delivery-call', args });
+      for (let i = 0; i < 20 && !delivered; i++) await new Promise(r => setImmediate(r));
+      assert.equal(deliveries, 2);
+      assert.equal(calls, state === 'invalid' ? 0 : 1);
+      assert.equal(delivered.callId, 'delivery-call');
+      if (state === 'success') {
+        assert.equal(delivered.ok, true);
+        assert.deepEqual(JSON.parse(JSON.stringify(delivered.result)), { action, uid: 123 });
+      } else {
+        assert.equal(delivered.ok, false);
+        if (state === 'unknown') assert.match(delivered.message, /结果不确定/);
+        else if (state === 'invalid') assert.match(delivered.message, /操作未执行/);
+        else assert.equal(delivered.message, expectedMessage);
+      }
+    }
+  }
+});

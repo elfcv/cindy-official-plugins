@@ -253,6 +253,7 @@ async function statusResult() {
 cindy.onHostMessage(function onHostMessage(message) {
   if (!message || message.type !== 'tool-call') return;
   void (async function dispatch() {
+    var reply;
     try {
       var result = message.tool === 'qq_mail_status'
         ? await statusResult()
@@ -261,23 +262,17 @@ cindy.onHostMessage(function onHostMessage(message) {
         : message.tool === 'qq_mail'
           ? await runMail(isObject(message.args) ? message.args : {}, message.callId)
           : fail('未知工具：' + message.tool);
-      if (result.ok) {
-        await cindy.send({
-          type: 'tool-result',
-          callId: message.callId,
-          ok: true,
-          result: result.result,
-        });
-      } else {
-        await cindy.send({
-          type: 'tool-result',
-          callId: message.callId,
-          ok: false,
-          message: result.message,
-        });
-      }
+      reply = {
+        type: 'tool-result',
+        callId: message.callId,
+        ok: result.ok,
+        ...(result.ok ? { result: result.result } : { message: result.message }),
+      };
+      await cindy.send(reply);
     } catch (error) {
-      await cindy.send({
+      // A delivery failure does not change the mailbox outcome. Retry only the
+      // exact reply, never the operation; retain success data and known failures.
+      await cindy.send(reply || {
         type: 'tool-result',
         callId: message.callId,
         ok: false,
