@@ -257,3 +257,36 @@ test('flag and move failures use the actual remote mutation stage', async () => 
     }
   }
 });
+
+test('symlink loops report a local attachment problem, not QQ rate limiting', async t => {
+  const { handleRequest } = require('../src/worker.cjs');
+  const dir = await fixture(t), link = path.join(dir, 'loop');
+  await fs.symlink('loop', link);
+  for (const action of ['send', 'draft']) {
+    await assert.rejects(handleRequest(requestFor({ ...base, action, attachment_paths: [link] }), {}), error => {
+      assert.equal(error.executionState, 'not_executed');
+      assert.match(error.message, /附件.*路径/);
+      assert.doesNotMatch(error.message, /频繁|稍后再试|结果不确定/);
+      return true;
+    });
+  }
+});
+test('attachment open/stat/read/close errors stay in the local file error domain', async t => {
+  const { handleRequest } = require('../src/worker.cjs');
+  for (const operation of ['open', 'stat', 'read', 'close']) {
+    let closed = false;
+    const fail = () => { throw Object.assign(new Error('too many symbolic links'), { code: 'ELOOP' }); };
+    const handle = { stat: async () => ({ isFile: () => true, size: 0 }), read: async () => ({ bytesRead: 0 }), close: async () => { closed = true; } };
+    if (operation !== 'open') handle[operation] = async () => { if (operation === 'close') closed = true; fail(); };
+    const mock = t.mock.method(fs, 'open', operation === 'open' ? fail : async () => handle);
+    try {
+      await assert.rejects(handleRequest(requestFor({ ...base, attachment_paths: [path.resolve('fixture.txt')] }), {}), error => {
+        assert.equal(error.executionState, 'not_executed');
+        assert.match(error.message, /附件.*路径/);
+        assert.doesNotMatch(error.message, /频繁/);
+        return true;
+      });
+      assert.equal(closed, operation !== 'open');
+    } finally { mock.mock.restore(); }
+  }
+});

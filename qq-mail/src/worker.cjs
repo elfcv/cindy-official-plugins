@@ -356,6 +356,16 @@ function mailOptions(credentials, action) {
   };
 }
 
+// Classify at the filesystem boundary, not by an incomplete errno list or
+// provider-oriented message matching (e.g. ELOOP contains "too many").
+async function attachmentFileOperation(operation) {
+  try {
+    return await operation();
+  } catch {
+    throw new Error('ATTACHMENT_UNREADABLE');
+  }
+}
+
 // Only the explicitly supplied local paths are read. Attachment bytes never enter
 // Agent parameters or RPC; Nodemailer receives bounded buffers, not file/URL access.
 async function prepareMailOptions(credentials, action) {
@@ -372,8 +382,8 @@ async function prepareMailOptions(credentials, action) {
     let handle;
     try {
       // Nonblocking open lets the subsequent fstat reject FIFOs/devices safely.
-      handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK || 0));
-      const stat = await handle.stat();
+      handle = await attachmentFileOperation(() => fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK || 0)));
+      const stat = await attachmentFileOperation(() => handle.stat());
       if (!stat.isFile()) throw new Error('ATTACHMENT_NOT_FILE');
       const remaining = MAX_ATTACHMENT_BYTES - total;
       if (stat.size > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
@@ -382,7 +392,7 @@ async function prepareMailOptions(credentials, action) {
       const chunks = [];
       let length = 0;
       while (true) {
-        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining - length + 1), null);
+        const { bytesRead } = await attachmentFileOperation(() => handle.read(buffer, 0, Math.min(buffer.length, remaining - length + 1), null));
         if (bytesRead === 0) break;
         length += bytesRead;
         if (length > remaining) throw new Error('ATTACHMENTS_TOO_LARGE');
@@ -391,13 +401,8 @@ async function prepareMailOptions(credentials, action) {
       const content = Buffer.concat(chunks, length);
       total += length;
       attachments.push({ filename: path.basename(file), content });
-    } catch (error) {
-      if (['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EISDIR'].includes(error.code)) {
-        throw new Error('ATTACHMENT_UNREADABLE');
-      }
-      throw error;
     } finally {
-      if (handle) await handle.close();
+      if (handle) await attachmentFileOperation(() => handle.close());
     }
   }
   if (attachments.length) options.attachments = attachments;
