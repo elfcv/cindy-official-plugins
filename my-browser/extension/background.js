@@ -1,13 +1,15 @@
 'use strict';
-if (typeof importScripts === 'function') importScripts('policy.js','network-guard.js','learning-core.js');
+if (typeof importScripts === 'function') importScripts('policy.js','network-guard.js','learning-core.js','youtube-transcript.js');
 // A lexical `const chrome` masks Chromium's lazy API initialization; use a var alias.
 var chrome = globalThis.browser || globalThis.chrome;
 const P = globalThis.MyBrowserPolicy;
 const network = globalThis.MyBrowserNetwork.create(chrome);
 const VERSION = chrome.runtime.getManifest().version;
+// Content/UI releases retain the signed 0.4.13 wire contract.
+const WIRE_VERSION = '0.4.13';
 let bridge = null;
 let discovery;
-let wireVersion=VERSION;
+let wireVersion=WIRE_VERSION;
 let running = false;
 const b64url = bytes => {
   let binary=''; for(const byte of new Uint8Array(bytes)) binary+=String.fromCharCode(byte);
@@ -88,13 +90,21 @@ async function discoverBridge() {
     const candidates=await Promise.all(Array.from({length:10},async(_,offset)=>{
       const port=first+offset,base='http://127.0.0.1:'+port;
       try{
-        let r=await fetchJSON(base,'/health',null,undefined,450,VERSION);
-        if(r.auth_required){auth=auth||await authReady().catch(()=>null);if(!auth)return null;r=await fetchJSON(base,'/health',null,undefined,450,VERSION,{publicKey:auth.publicKey});}
-        if(r.challenge){auth=auth||await authReady().catch(()=>null);if(!auth)return null;const proof=await auth.sign(r.challenge);r=await fetchJSON(base,'/health',null,undefined,450,VERSION,{publicKey:auth.publicKey,proof});}
+        let r=await fetchJSON(base,'/health',null,undefined,450,WIRE_VERSION);
+        if(r.auth_required){auth=auth||await authReady().catch(()=>null);if(!auth)return null;r=await fetchJSON(base,'/health',null,undefined,450,WIRE_VERSION,{publicKey:auth.publicKey});}
+        if(r.challenge){auth=auth||await authReady().catch(()=>null);if(!auth)return null;const proof=await auth.sign(r.challenge);r=await fetchJSON(base,'/health',null,undefined,450,WIRE_VERSION,{publicKey:auth.publicKey,proof});}
         if(r.plugin!=='my-browser'||r.protocol!==3||r.extensionId!==chrome.runtime.id)return null;
-        if(r.version!==VERSION&&!['0.4.0','0.4.1','0.4.2','0.4.3','0.4.4','0.4.5','0.4.6','0.4.7','0.4.8','0.4.9','0.4.10','0.4.11','0.4.12'].includes(r.version)&&!/^0\.3\.\d+$/.test(r.version)){diagnostic='UPDATE_CINDY_CHROME';return null;}
+        if(r.version!==WIRE_VERSION&&!['0.4.0','0.4.1','0.4.2','0.4.3','0.4.4','0.4.5','0.4.6','0.4.7','0.4.8','0.4.9','0.4.10','0.4.11','0.4.12'].includes(r.version)&&!/^0\.3\.\d+$/.test(r.version)){diagnostic='UPDATE_CINDY_CHROME';return null;}
         const version=r.version;
-        if(version!==VERSION){r=await fetchJSON(base,'/health',null,undefined,450,version);if(r.auth_required){auth=auth||await authReady().catch(()=>null);if(!auth)return null;r=await fetchJSON(base,'/health',null,undefined,450,version,{publicKey:auth.publicKey});}if(r.challenge){auth=auth||await authReady().catch(()=>null);if(!auth)return null;const proof=await auth.sign(r.challenge);if(!proof)return null;r=await fetchJSON(base,'/health',null,undefined,450,version,{publicKey:auth.publicKey,proof});}if(r.plugin!=='my-browser'||r.protocol!==3||r.extensionId!==chrome.runtime.id||r.version!==version)return null;}
+        if(version!==WIRE_VERSION){r=await fetchJSON(base,'/health',null,undefined,450,version);if(r.auth_required){auth=auth||await authReady().catch(()=>null);if(!auth)return null;r=await fetchJSON(base,'/health',null,undefined,450,version,{publicKey:auth.publicKey});}if(r.challenge){auth=auth||await authReady().catch(()=>null);if(!auth)return null;const proof=await auth.sign(r.challenge);if(!proof)return null;r=await fetchJSON(base,'/health',null,undefined,450,version,{publicKey:auth.publicKey,proof});}if(r.plugin!=='my-browser'||r.protocol!==3||r.extensionId!==chrome.runtime.id||r.version!==version)return null;}
+        if(r.native_binding_required){
+          try {
+            const registered=await Promise.race([chrome.runtime.sendNativeMessage('com.makecindy.browser',{port,clientId,publicKey:auth.publicKey}),sleep(10000).then(()=>{throw Error('NATIVE_BINDING_UNAVAILABLE');})]);
+            if(!registered?.ok)throw Error('NATIVE_BINDING_UNAVAILABLE');
+            const proof=await auth.sign(r.challenge);
+            r=await fetchJSON(base,'/health',null,undefined,1500,version,{publicKey:auth.publicKey,proof});
+          }catch{diagnostic='NATIVE_BINDING_UNAVAILABLE';return null;}
+        }
         if(r.pairing_required){diagnostic='PAIRING_REQUIRED';return null;}
         if(typeof r.session!=='string'||!r.session)return null;
         const learning=r.capabilities?.includes('learning-v1')===true&&r.capabilities?.includes('learning-auth-v2')===true;
@@ -141,13 +151,17 @@ chrome.tabs.onActivated.addListener(({tabId}) => { restore.then(async () => {
   await remember();
 }); });
 async function waitForLoad(id) {
-  const end = Date.now()+15000;
+  const end = Date.now()+25000;
   while (Date.now()<end) {
     const tab = await chrome.tabs.get(id);
-    if (tab.status === 'complete') { await sleep(250); return chrome.tabs.get(id); }
+    // Images, ads and media can keep the tab loading after its main document is
+    // usable. Only accept DOM readiness bound to the current browser document.
+    if (tab.status === 'complete' || await network.isReady?.(id)) { await sleep(250); return chrome.tabs.get(id); }
     await sleep(150);
   }
-  throw new Error('PAGE_LOAD_TIMEOUT');
+  const latest=await chrome.tabs.get(id);
+  if(latest.status==='complete' || await network.isReady?.(id))return latest;
+  throw Object.assign(new Error('PAGE_LOAD_TIMEOUT'),{tabId:id,tabStatus:latest.status});
 }
 async function ensureTab(url,policy,action,onNavigate = () => {}) {
   await restore;
@@ -508,21 +522,24 @@ async function handle(job,policy,target) {
   if (!gate.ok) return gate;
   if (job.action === 'tabs') {
     const tabs = (await chrome.tabs.query({})).filter(t => /^https?:/.test(t.url || '') && (!job.payload.host || (P.check(policy,'text',t.url).ok && P.matches(new URL(t.url).hostname,P.normalizeHost(job.payload.host)))));
-    const records=[];let remaining=30000;
+    const records=[];let remaining=30000,truncated=false;
     for (const t of tabs) {
-      if (records.length>=(job.payload.limit || 20)) break;
-      let metadata;
+      let metadata,diagnostic;
       if(P.check(policy,'text',t.url).ok)try {
         const documentId=await network.document(t.id);
         const out=await chrome.scripting.executeScript({target:{tabId:t.id,documentIds:[documentId]},world:'ISOLATED',func:()=>({url:location.href,title:document.title.slice(0,160)})});
         if(out?.[0]?.documentId===documentId && P.check(policy,'text',out[0].result?.url).ok)metadata=out[0].result;
-      }catch {}
-      if(job.payload.host && (!metadata || !P.matches(new URL(metadata.url).hostname,P.normalizeHost(job.payload.host))))continue;
-      const row=metadata ? {id:t.id,title:metadata.title,...(metadata.url.length<=8192 ? {url:P.redactUrl(metadata.url)} : {url_omitted:true}),active:t.active} : {id:t.id,redacted:true};
-      const size=JSON.stringify(row).length;if (size>remaining) break;
+      }catch(e){diagnostic={error:e.message==='ADDRESS_UNVERIFIED'?'ADDRESS_UNVERIFIED':'TAB_ACCESS_FAILED',...(e.message==='ADDRESS_UNVERIFIED'?{reason:e.reason}: {})};}
+      if(job.payload.host && diagnostic?.reason==='LOCAL_ADDRESS')continue;
+      if(job.payload.host && metadata && !P.matches(new URL(metadata.url).hostname,P.normalizeHost(job.payload.host)))continue;
+      if (records.length>=(job.payload.limit || 20)) {truncated=true;break;}
+      // Keep denied/unobserved tabs visible as bounded diagnostics. Never read
+      // their title or expose their URL merely to make the list look complete.
+      const row=metadata ? {id:t.id,title:metadata.title,...(metadata.url.length<=8192 ? {url:P.redactUrl(metadata.url)} : {url_omitted:true}),active:t.active,status:t.status} : {id:t.id,redacted:true,status:t.status,...diagnostic};
+      const size=JSON.stringify(row).length;if (size>remaining) {truncated=true;break;}
       records.push(row);remaining-=size;
     }
-    return {ok:true,tabs:records,truncated:records.length<tabs.length};
+    return {ok:true,tabs:records,truncated};
   }
   let injecting = false, navigating = false;
   const failureState = () => navigating || (injecting && P.INTERACT.includes(job.action)) ? 'unknown' : 'not_executed';
@@ -552,8 +569,8 @@ async function handle(job,policy,target) {
     if (result.url && !P.check(policy,job.action,result.url).ok) return fail('REDIRECT_BLOCKED','The page moved to a blocked site. No content is returned; verify the action manually.',failureState());
     return result?.error && navigating ? {...result,execution:'unknown'} : result;
   } catch (e) {
-    const messages = {BROWSER_PAGE_RESTRICTED:'Chrome protects this Web Store domain from extension access, including the legacy developer console. Store-installed extensions have the same restriction. Refreshing or granting site access will not help; no page content was read or modified.',ADDRESS_UNVERIFIED:'The browser could not verify this document. See reason for missing navigation/response evidence or a non-public peer. No page content was read. Do not automatically retry, refresh, switch tools or create replacement tabs.',PAGE_NOT_OPEN:'This action has no open target. Inspect browser_tabs once; do not repeatedly open the URL to repair a stale action.',PAGE_CHANGED:'The existing tab navigated. No new tab was opened. Inspect browser_tabs once and use the actual URL; do not retry the old URL or invent URL variants.',TAB_LIMIT:'Three plugin-created tabs are still open and cannot safely be closed. No new tab was opened. Use an existing tab or ask the user to close unneeded tabs; do not retry in a loop.',TAB_ACCESS_FAILED:'The existing tab is still present but inaccessible. No replacement was opened. Check browser permissions.',PAGE_LOAD_TIMEOUT:'Loading timed out; the same tab was retained. Inspect its state once. Do not loop retries, change query strings, or open duplicate URLs.',REDIRECT_BLOCKED:'The existing tab redirected to a site that is not allowed. No replacement will be opened. Review its permissions; do not bypass the denial.'};
-    return {...fail(e.message in messages ? e.message : 'CHROME_OPERATION_FAILED',messages[e.message] || 'Browser access failed. Inspect the existing page and extension permissions; do not automatically open a replacement.',failureState()),...(e.message==='ADDRESS_UNVERIFIED' ? {reason:e.reason || 'UNKNOWN'} : {}),retryable:false};
+    const messages = {BROWSER_PAGE_RESTRICTED:'Chrome protects this Web Store domain from extension access, including the legacy developer console. Store-installed extensions have the same restriction. Refreshing or granting site access will not help; no page content was read or modified.',ADDRESS_UNVERIFIED:'The browser could not identify an accessible current document. See reason for the document or local-URL restriction. No page content was read. Inspect the retained tab; do not open replacements or retry in a loop.',PAGE_NOT_OPEN:'This action has no open target. Inspect browser_tabs once; do not repeatedly open the URL to repair a stale action.',PAGE_CHANGED:'The existing tab navigated. No new tab was opened. Inspect browser_tabs once and use the actual URL; do not retry the old URL or invent URL variants.',TAB_LIMIT:'Three plugin-created tabs are still open and cannot safely be closed. No new tab was opened. Use an existing tab or ask the user to close unneeded tabs; do not retry in a loop.',TAB_ACCESS_FAILED:'The existing tab is still present but inaccessible. No replacement was opened. Check browser permissions.',PAGE_LOAD_TIMEOUT:'Loading timed out; the same tab was retained. Inspect its state once. Do not loop retries, change query strings, or open duplicate URLs.',REDIRECT_BLOCKED:'The existing tab redirected to a site that is not allowed. No replacement will be opened. Review its permissions; do not bypass the denial.'};
+    return {...fail(e.message in messages ? e.message : 'CHROME_OPERATION_FAILED',messages[e.message] || 'Browser access failed. Inspect the existing page and extension permissions; do not automatically open a replacement.',failureState()),...(e.message==='ADDRESS_UNVERIFIED' ? {reason:e.reason || 'UNKNOWN'} : {}),...(e.message==='PAGE_LOAD_TIMEOUT'?{tabId:e.tabId,status:e.tabStatus}:{}),retryable:false};
   }
 }
 async function chain() {
@@ -675,7 +692,7 @@ async function learningRequest(message,sender) {
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if(sender.id!==chrome.runtime.id)return;
   if(message?.type==='cindy-learning') {
-    learningRequest(message,sender).then(reply).catch(e=>reply({ok:false,error:e.message}));return true;
+    learningRequest(message,sender).then(reply).catch(e=>reply({ok:false,error:e.message,...(e.message==='ADDRESS_UNVERIFIED'?{reason:e.reason}: {})}));return true;
   }
   if(message?.type==='cindy-cancel') {
     const call=learningCalls.get(message.id);
@@ -709,6 +726,28 @@ chrome.runtime.onMessage.addListener((m,sender,reply)=>{
 });
 // YouTube exposes timed caption metadata through its own player. Read only this
 // fixed field; no arbitrary page JavaScript and no cookies leave the browser.
+async function fetchYoutubeCaptions(url) {
+  let response,data;
+  try {
+    response=await fetch(url,{credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000)});
+    if(!response.ok)throw Error('SUBTITLE_UNAVAILABLE');
+    if(!response.body)throw Error('SUBTITLE_EMPTY');
+    const reader=response.body.getReader(),parts=[];let bytes=0;
+    try{for(;;){const {done,value}=await reader.read();if(done)break;bytes+=value.length;if(bytes>2000000)throw Error('SUBTITLE_TOO_LARGE');parts.push(value);}}finally{await reader.cancel().catch(()=>{});}
+    data=new Uint8Array(bytes);let at=0;for(const part of parts){data.set(part,at);at+=part.length;}
+  } catch(e) {
+    if(['SUBTITLE_UNAVAILABLE','SUBTITLE_EMPTY','SUBTITLE_TOO_LARGE'].includes(e.message))throw e;
+    throw Error(['TimeoutError','AbortError'].includes(e.name)?'SUBTITLE_TIMEOUT':'SUBTITLE_FETCH_FAILED');
+  }
+  const text=new TextDecoder().decode(data);
+  if(!text.trim())throw Error('SUBTITLE_EMPTY');
+  let parsed;
+  try{parsed=JSON.parse(text);}catch{throw Error('SUBTITLE_RESPONSE_INVALID');}
+  if(!parsed||!Array.isArray(parsed.events))throw Error('SUBTITLE_RESPONSE_INVALID');
+  const cues=globalThis.CindyLearning.youtubeSubtitles(parsed);
+  if(!cues.length)throw Error('SUBTITLE_EMPTY');
+  return cues;
+}
 chrome.runtime.onMessage.addListener((m,sender,reply)=>{
   if(m?.type!=='cindy-captions'||sender.id!==chrome.runtime.id)return;
   (async()=>{
@@ -722,21 +761,28 @@ chrome.runtime.onMessage.addListener((m,sender,reply)=>{
     }});
     const tracks=result?.[0]?.documentId===documentId?result[0].result:[];
     const track=tracks.find(t=>t.language===m.language)||tracks.find(t=>t.kind!=='asr')||tracks[0];
-    if(!track)return {ok:true,cues:[]};
-    const url=new URL(track.url);
-    if(url.protocol!=='https:'||!/(^|\.)youtube\.com$/.test(url.hostname)||url.pathname!=='/api/timedtext'||url.username||url.password)throw Error('INVALID_SUBTITLE_SOURCE');
-    url.searchParams.set('fmt','json3');
-    const response=await fetch(url.href,{credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000)});
-    if(!response.ok)throw Error('SUBTITLE_UNAVAILABLE');
-    const reader=response.body.getReader(),parts=[];let bytes=0;
-    try{for(;;){const {done,value}=await reader.read();if(done)break;bytes+=value.length;if(bytes>2000000)throw Error('SUBTITLE_TOO_LARGE');parts.push(value);}}finally{await reader.cancel().catch(()=>{});}
-    const data=new Uint8Array(bytes);let at=0;for(const part of parts){data.set(part,at);at+=part.length;}
-    const parsed=JSON.parse(new TextDecoder().decode(data));
-    const cues=globalThis.CindyLearning.youtubeSubtitles(parsed);
+    let cues=[],sourceError;
+    if(track){
+      const url=new URL(track.url);
+      if(url.protocol!=='https:'||!/(^|\.)youtube\.com$/.test(url.hostname)||url.pathname!=='/api/timedtext'||url.username||url.password)throw Error('INVALID_SUBTITLE_SOURCE');
+      url.searchParams.set('fmt','json3');
+      try{cues=await fetchYoutubeCaptions(url.href);}catch(e){
+        if(!['SUBTITLE_EMPTY','SUBTITLE_RESPONSE_INVALID','SUBTITLE_UNAVAILABLE','SUBTITLE_TIMEOUT','SUBTITLE_FETCH_FAILED'].includes(e.message))throw e;
+        sourceError=e;
+      }
+    }
+    if(!cues.length){
+      const fallback=await chrome.scripting.executeScript({target:{tabId:tab.id,documentIds:[documentId]},world:'MAIN',func:globalThis.CindyYoutubeTranscript.read,args:[tab.url]});
+      if(fallback?.[0]?.documentId!==documentId)throw Error('PAGE_CHANGED');
+      const transcript=fallback[0].result;
+      if(!transcript?.ok)throw Error(transcript?.error==='SUBTITLE_UNAVAILABLE'?sourceError?.message||'SUBTITLE_UNAVAILABLE':transcript?.error||'SUBTITLE_UNAVAILABLE');
+      cues=transcript.cues;
+      if(!cues.length&&sourceError)throw sourceError;
+    }
     await learningRequest({id:crypto.randomUUID(),request:{op:'config'}},sender);
     if((await chrome.tabs.get(tab.id)).url!==tab.url)throw Error('PAGE_CHANGED');
-    return {ok:true,cues,language:track.language};
-  })().then(reply).catch(e=>reply({ok:false,error:e.message}));return true;
+    return {ok:true,cues,language:track?.language};
+  })().then(reply).catch(e=>reply({ok:false,error:e.message,...(e.message==='ADDRESS_UNVERIFIED'?{reason:e.reason}: {})}));return true;
 });
 
 // Resume only the user's subtitle panel on the same tab and exact URL after reload.

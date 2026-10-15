@@ -143,7 +143,7 @@ test('manifest 声明 Cindy 持久凭证及其最小 Node 注入范围', () => {
   // hardcoded version goes stale on every release bump.
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
   assert.equal(manifest.schemaVersion, 3);
-  assert.equal(manifest.slots, undefined);
+  assert.equal(Object.hasOwn(manifest, 'slots'), false);
   assert.equal(manifest.minCindyVersion, '0.1.92');
   assert.equal(manifest.settingsHtml, 'settings.html');
   assert.equal(

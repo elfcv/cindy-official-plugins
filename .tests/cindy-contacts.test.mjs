@@ -976,3 +976,53 @@ test('拆开合并：共同往来很多也能一次拆开；别的合并仍需�
     a.close();
   }
 });
+
+test('人物页对话：记得上文；删改档案交给任务直接改；快速通道判断要动手时转交', async () => {
+  const dir = tmp();
+  const a = boot({ libDir: dir });
+  try {
+    const p = ok(await a.call('save', { name: '姚刘浏', open_loops: ['核对最新日历接口并推进提案或 PR'] }));
+    a.tasks.quick = { ok: true, text: '档案里有一条还没完的事：核对最新日历接口。' };
+    const q1 = (await a.view('ask', { contactId: p.id, text: '她还有什么事没完' })).result;
+    assert.equal(q1.kind, 'answer');
+
+    // 第二句「对的」：快速回答的提示里带着上一轮问答
+    a.tasks.quick = { ok: true, text: '[[TASK]]' };
+    const q2 = (await a.view('ask', { contactId: p.id, text: '对的' })).result;
+    assert.match(a.oneshots.at(-1).prompt, /之前的对话：[\s\S]*她还有什么事没完[\s\S]*核对最新日历接口/);
+    // 快速通道判断要动手：转交任务，任务提示带上文并要求直接改
+    assert.equal(q2.kind, 'task');
+    assert.match(a.tasks.sent.at(-1).text, /之前的对话|接着人物页上之前的对话/);
+    assert.match(a.tasks.sent.at(-1).text, /她还有什么事没完/);
+    assert.match(a.tasks.sent.at(-1).text, /不要再问确认/);
+    assert.match(a.tasks.sent.at(-1).text, /征求意见时，只回答和给建议，不改档案/);
+    assert.ok(!(await a.view('qa', { contactId: p.id })).result.some((x) => String(x.a || '').includes('[[TASK]]')));
+
+    // 回答里只是引用到记号，不算转交
+    for (let i = 0; i < 100 && !a.events.some((e) => e.name === 'task' && e.data.status === 'done'); i++) await new Promise((r) => setTimeout(r, 20));
+    a.tasks.quick = { ok: true, text: '档案里提到了 [[TASK]] 这个写法。' };
+    assert.equal((await a.view('ask', { contactId: p.id, text: '档案里有没有写 [[TASK]]' })).result.kind, 'answer');
+    // 「帮我删了」不经快速通道，直接交给任务
+    const before = a.oneshots.length;
+    // 等上一件交给任务的事做完（同一个人同时只跑一件）
+    for (let i = 0; i < 100 && !a.events.some((e) => e.name === 'task' && e.data.status === 'done'); i++) await new Promise((r) => setTimeout(r, 20));
+    const q3 = (await a.view('ask', { contactId: p.id, text: '没这事儿，帮我删了' })).result;
+    assert.equal(q3.kind, 'task');
+    assert.equal(a.oneshots.length, before, 'edit requests skip the read-only quick path');
+    // 「对不对」是提问，不当成要改
+    a.tasks.quick = { ok: true, text: '对。' };
+    assert.equal((await a.view('ask', { contactId: p.id, text: '她是做设计的，对不对' })).result.kind, 'answer');
+    // 带「不对」「删」的问句也不直接交给会改档案的任务
+    assert.equal((await a.view('ask', { contactId: p.id, text: '她这样做不对吗？' })).result.kind, 'answer');
+    assert.equal((await a.view('ask', { contactId: p.id, text: '那条待办删了吗' })).result.kind, 'answer');
+    assert.equal((await a.view('ask', { contactId: p.id, text: '那条待办删了吗。' })).result.kind, 'answer');
+    // 「不对」「错了」是评价，不算要改；「删了吧」是要删
+    assert.equal((await a.view('ask', { contactId: p.id, text: '她这样做不对吧' })).result.kind, 'answer');
+    assert.equal((await a.view('ask', { contactId: p.id, text: '要不要删这条' })).result.kind, 'answer');
+    assert.equal((await a.view('ask', { contactId: p.id, text: '这条删不删' })).result.kind, 'answer');
+    for (let i = 0; i < 100 && a.events.filter((e) => e.name === 'task' && e.data.status === 'done').length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal((await a.view('ask', { contactId: p.id, text: '那就帮我删了吧' })).result.kind, 'task');
+  } finally {
+    a.close();
+  }
+});

@@ -17,7 +17,6 @@ test('Chrome reading: compact UI, independent subtitle modes/languages, auto You
  const extension=path.join(profile,'extension');await fs.cp(path.join(root,'extension'),extension,{recursive:true});
  const {publicKey}=generateKeyPairSync('rsa',{modulusLength:2048,publicKeyEncoding:{type:'spki',format:'der'}}),extensionId=createHash('sha256').update(publicKey).digest('hex').slice(0,32).replace(/[0-9a-f]/g,c=>String.fromCharCode(97+parseInt(c,16)));
  const manifest=JSON.parse(await fs.readFile(path.join(extension,'manifest.json'),'utf8'));manifest.key=publicKey.toString('base64');await fs.writeFile(path.join(extension,'manifest.json'),JSON.stringify(manifest));
- const bg=path.join(extension,'background.js');await fs.writeFile(bg,`const nativeCompleted=chrome.webRequest.onCompleted.addListener.bind(chrome.webRequest.onCompleted);chrome.webRequest.onCompleted.addListener=(fn,...a)=>nativeCompleted(d=>fn(['example.test','www.youtube.com'].includes(new URL(d.url).hostname)?{...d,ip:'8.8.8.8'}:d),...a);\n`+await fs.readFile(bg,'utf8'));
  const files=new Map(),modelCalls=[];let subtitleMismatch=false,allowBroken=false,transientFailures=0;const prefetchGates=new Map(),prefetchStarted=[];
  const service=createLearningService({core,locale:()=> 'zh-CN',model:async r=>{
   modelCalls.push(r);const material=JSON.parse(r.prompt.split('\n').at(-1));

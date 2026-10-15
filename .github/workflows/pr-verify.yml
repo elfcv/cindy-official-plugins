@@ -134,6 +134,12 @@ jobs:
           done
           exit "${failed}"
 
+      - name: Set up native browser host build toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+
       - name: Dry-run plugin packaging
         id: packages
         if: ${{ steps.changes.outputs.plugins != '[]' }}

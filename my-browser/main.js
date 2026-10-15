@@ -102,10 +102,10 @@ async function handleTool(name,args) {
     if (!status?.ok) return status||fail('STATUS_UNAVAILABLE','Cannot check browser connections. Re-enable Cindy Chrome and refresh its settings.');
     // Tool output is an explicit projection. The settings channel below retains
     // policy, extension_dir and pairing identity details without sending them to AI.
-    return {ok:true,version:status.version,protocol:status.protocol,extension_connected:status.extension_connected,
-      clients:(status.clients || []).map(c=>({id:c.id,browser:c.browser,version:c.version,protocolVersion:c.protocolVersion,connected:c.connected,trusted:c.trusted})),
+    return {ok:true,version:status.version,protocol:status.protocol,extension_connected:status.extension_connected,nativeBinding:status.nativeBinding,
+      clients:(status.clients || []).map(c=>({id:c.id,browser:c.browser,version:c.version,protocolVersion:c.protocolVersion,connected:c.connected,trusted:c.trusted,identitySupported:c.identitySupported,nativeBindingRequired:c.nativeBindingRequired})),
       installation:{ok:!!installation?.ok,browsers:(installation?.browsers || []).map(b=>({browser:b.browser,supported:b.supported,installed:b.installed,published:b.published,bundled:b.bundled}))},
-      how_to_install:'Open Cindy Chrome plugin settings and choose Install extension. Chrome uses the official Chrome Web Store listing; Edge uses the developer directory fallback until an Edge store route is published. Return here after installation and wait for a live connection. Directory loading is the only developer fallback included in this plugin package.'};
+      how_to_install:'Open Cindy Chrome plugin settings and choose Install extension. Chrome uses the official Chrome Web Store listing; Edge uses the developer directory fallback until an Edge store route is published. Keep Cindy Chrome enabled after installation; updated official extensions connect automatically. If nativeBinding is unavailable, re-enable the plugin; new profiles need Chrome extension 0.4.16 or later. Directory loading is the only developer fallback included in this plugin package.'};
   }
   if (name === 'browser_tabs') return node('act',{action:'tabs',payload:P.validate('tabs',args)});
   if (name === 'browser_read') {
@@ -137,26 +137,11 @@ cindy.onHostMessage(async msg => {
 });
 channel.onmessage = async ev => {
   const m = ev.data || {};
-  if (!['status-request','save-request','install-request','pair-request'].includes(m.type) || typeof m.id !== 'string') return;
+  if (!['status-request','save-request','install-request'].includes(m.type) || typeof m.id !== 'string') return;
   let result;
   try {
     if (m.type === 'save-request') result = await serialize(() => save(m.policy,m.base));
     else if (m.type === 'install-request') result = await node('openInstallation',{browser:m.browser,mode:m.mode});
-    else if (m.type === 'pair-request') result = await serialize(async () => {
-      const status=await node('status');
-      const client=status.clients?.find(c => c.id === m.clientId);
-      if (!client) return fail('BROWSER_DISCONNECTED','Reconnect the browser before pairing.');
-      const consent=await cindy.confirm({body:'Connect '+client.browser+' to Cindy?\n'+client.origin+'\nProfile: '+client.id,confirmText:'Connect',cancelText:'Cancel',danger:true});
-      if (!consent.ok || !consent.confirmed) return fail('PAIRING_CANCELLED','No browser was authorized.');
-      const current=(await node('status')).clients?.find(c => c.id === client.id && c.origin === client.origin && c.extensionId === client.extensionId);
-      if (!current) return fail('BROWSER_DISCONNECTED','The browser identity changed during confirmation.');
-      const {cfg}=await load();
-      const pairedClients=[...(cfg.pairedClients || []).filter(c => c.id !== client.id),{id:client.id,origin:client.origin,extensionId:client.extensionId,...(typeof client.publicKey==='string' ? {publicKey:client.publicKey} : {})}];
-      if (pairedClients.length>16) return fail('TOO_MANY_BROWSERS','At most 16 paired browser profiles are supported.');
-      const saved=await fetch('/kv',{method:'PUT',body:JSON.stringify({...cfg,pairedClients})});
-      if (!saved.ok) return fail('SAVE_FAILED','Browser authorization was not saved.');
-      return node('setTrustedClients',{clients:pairedClients});
-    });
     else { await sync(); result = {...await node('status'),installation:await node('installation')}; }
   } catch (e) { result = fail(e?.code || 'SETTINGS_ERROR',e.message || 'Reload plugin settings.',e?.execution || 'not_executed'); }
   channel.postMessage({type:'response',id:m.id,result});

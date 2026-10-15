@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-const version=JSON.parse(fs.readFileSync(new URL('../my-browser/extension/manifest.json',import.meta.url),'utf8')).version;
+const installedVersion=JSON.parse(fs.readFileSync(new URL('../my-browser/extension/manifest.json',import.meta.url),'utf8')).version;
+const version='0.4.13'; // Stable signed wire contract, independent of extension releases.
 const source=fs.readFileSync(new URL('../my-browser/extension/background.js',import.meta.url),'utf8');
 test('discovery continues past mismatched and unpaired bridges without opening tabs',async()=>{
   const ports=[],saved={};
   const noop={addListener(){}};
-  const chrome={runtime:{id:'fixture',getManifest:()=>({version}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},
+  const chrome={runtime:{id:'fixture',getManifest:()=>({version:installedVersion}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},
     storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async v=>Object.assign(saved,v)}},
     tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
   const context={chrome,MyBrowserNetwork:{create:()=>({})},MyBrowserPolicy:{},navigator:{userAgent:'Chrome'},URL,AbortController,setTimeout,clearTimeout,crypto:globalThis.crypto,
@@ -17,7 +18,7 @@ test('discovery continues past mismatched and unpaired bridges without opening t
 });
 for(const previousVersion of ['0.3.48','0.4.0','0.4.1','0.4.2','0.4.3','0.4.4','0.4.5','0.4.6','0.4.7','0.4.8','0.4.9','0.4.10','0.4.11','0.4.12'])test('a new extension negotiates plugin '+previousVersion,async()=>{
  const versions=[],noop={addListener(){}},saved={};
- const chrome={runtime:{id:'fixture',getManifest:()=>({version}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async v=>Object.assign(saved,v)}},tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
+ const chrome={runtime:{id:'fixture',getManifest:()=>({version:installedVersion}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async v=>Object.assign(saved,v)}},tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
  const context={chrome,MyBrowserNetwork:{create:()=>({})},MyBrowserPolicy:{},navigator:{userAgent:'Chrome'},URL,AbortController,setTimeout,clearTimeout,crypto:globalThis.crypto,fetch:async(_url,options)=>{versions.push(options.headers['X-My-Browser-Version']);return {ok:true,json:async()=>({plugin:'my-browser',protocol:3,extensionId:'fixture',version:previousVersion,session:'old-session',capabilities:[]})};}};
  vm.runInNewContext(source.replace(/\nchain\(\);\s*$/,'')+'\nglobalThis.discoverTest=discover;',context);
  const found=await context.discoverTest();assert.equal(found.session,'old-session');assert.equal(found.learning,false);assert.equal(versions.filter(v=>v===version).length,10);assert.equal(versions.filter(v=>v===previousVersion).length,10);assert.equal(saved.connection.connected,true);
@@ -25,7 +26,7 @@ for(const previousVersion of ['0.3.48','0.4.0','0.4.1','0.4.2','0.4.3','0.4.4','
 
 test('an updated extension keeps a paired older bridge connected while negotiating learning',async()=>{
  const noop={addListener(){}},saved={},auth={publicKey:'test-key',sign:async()=>new Uint8Array()};
- const chrome={runtime:{id:'fixture',getManifest:()=>({version}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async v=>Object.assign(saved,v)}},tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
+ const chrome={runtime:{id:'fixture',getManifest:()=>({version:installedVersion}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async v=>Object.assign(saved,v)}},tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
  const calls=[];const context={chrome,MyBrowserNetwork:{create:()=>({})},MyBrowserPolicy:{},navigator:{userAgent:'Chrome'},URL,AbortController,setTimeout,clearTimeout,crypto:globalThis.crypto,TextEncoder,Buffer,btoa:value=>Buffer.from(value,'binary').toString('base64'),__testAuth:auth,
    fetch:async(url,options)=>{const headers=options.headers;calls.push({url,key:headers['X-My-Browser-Key'],proof:headers['X-My-Browser-Proof']});return {ok:true,json:async()=>headers['X-My-Browser-Key']?{plugin:'my-browser',protocol:3,extensionId:'fixture',version:'0.4.12',session:'old-session',capabilities:[]}:{plugin:'my-browser',protocol:3,extensionId:'fixture',version:'0.4.12',session:'old-session',challenge:'old-challenge',auth_required:false}};}};
  context.globalThis=context;
@@ -35,7 +36,7 @@ test('an updated extension keeps a paired older bridge connected while negotiati
 
 function workerContext(fetch){
   const noop={addListener(){}};
-  const chrome={runtime:{id:'fixture',getManifest:()=>({version}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async()=>{}}},tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
+  const chrome={runtime:{id:'fixture',getManifest:()=>({version:installedVersion}),getURL:()=> 'chrome-extension://fixture/',onStartup:noop,onInstalled:noop,onMessage:noop},storage:{local:{get:async()=>({clientId:'fixture'}),set:async()=>{}},session:{get:async()=>({}),set:async()=>{}}},tabs:{onRemoved:noop,onActivated:noop},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
  const testAuth={publicKey:'test-key',sign:async()=>new Uint8Array()};
  const context={chrome,MyBrowserNetwork:{create:()=>({})},MyBrowserPolicy:{},navigator:{userAgent:'Chrome'},URL,AbortController,setTimeout,clearTimeout,crypto:globalThis.crypto,TextEncoder,Buffer,btoa:value=>Buffer.from(value,'binary').toString('base64'),__testAuth:testAuth,fetch};
  vm.runInNewContext(source.replace(/\nchain\(\);\s*$/,'').replace('return {base,port,version,session:r.session,learning,auth};','return {base,port,version,session:r.session,learning,auth:globalThis.__testAuth};')+'\nglobalThis.testAPI={discover,learningFetch};',context);return context.testAPI;
@@ -71,7 +72,7 @@ test('discovery finds a bridge past the original ten ports and rejects generic H
 test('cancel during discovery prevents submission and cannot be forged by another document',async()=>{
  const core=(await import('./../my-browser/extension/learning-core.js')).default||globalThis.CindyLearning;
  const listeners=[],starts=[],noop={addListener(){}};let release;const gate=new Promise(r=>release=r);
- const chrome={runtime:{id:'fixture',getManifest:()=>({version}),getURL:p=>'chrome-extension://fixture/'+p,onStartup:noop,onInstalled:noop,onMessage:{addListener:f=>listeners.push(f)}},storage:{local:{get:async()=>({clientId:crypto.randomUUID()}),set:async()=>{}},session:{get:async()=>({}),set:async()=>{}}},tabs:{onRemoved:noop,onActivated:noop,get:async()=>({id:1,url:'https://example.test/watch',title:'Test'}),sendMessage:async()=>{}},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
+ const chrome={runtime:{id:'fixture',getManifest:()=>({version:installedVersion}),getURL:p=>'chrome-extension://fixture/'+p,onStartup:noop,onInstalled:noop,onMessage:{addListener:f=>listeners.push(f)}},storage:{local:{get:async()=>({clientId:crypto.randomUUID()}),set:async()=>{}},session:{get:async()=>({}),set:async()=>{}}},tabs:{onRemoved:noop,onActivated:noop,get:async()=>({id:1,url:'https://example.test/watch',title:'Test'}),sendMessage:async()=>{}},alarms:{create(){},onAlarm:noop},action:{setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{}}};
  const context={chrome,MyBrowserNetwork:{create:()=>({document:async()=> 'doc'})},MyBrowserPolicy:{},CindyLearning:core,navigator:{userAgent:'Chrome'},URL,AbortController,setTimeout,clearTimeout,crypto,TextEncoder,Buffer,btoa:value=>Buffer.from(value,'binary').toString('base64'),
  fetch:async(url,opt)=>{if(url.endsWith('/health')){await gate;return {ok:true,json:async()=>({plugin:'my-browser',protocol:3,extensionId:'fixture',version,session:'session',capabilities:['learning-v1','learning-auth-v2']})};}if(url.endsWith('/learning/challenge'))return {ok:true,json:async()=>({ok:true,challenge:'challenge'})};if(url.endsWith('/learning/start'))starts.push(JSON.parse(opt.body).id);return {ok:true,json:async()=>url.endsWith('/learning/result')?{done:true,result:{ok:true}}:{ok:true}};}};
  context.__testAuth={publicKey:'test-key',sign:async()=>new Uint8Array()};

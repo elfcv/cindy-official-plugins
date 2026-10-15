@@ -19,8 +19,16 @@ plugin_directory="${1:?usage: package-plugin.sh <plugin-directory> <output-file>
 output_file="${2:?usage: package-plugin.sh <plugin-directory> <output-file>}"
 # Opt-in only. Legacy plugins keep the original toolchain and archive bytes.
 if git cat-file -e "HEAD:${plugin_directory}/binary-dependencies.json" 2>/dev/null; then
-  exec python3 "$(dirname "$0")/binary-dependencies.py" "${plugin_directory}" "${output_file}"
-fi
+  python3 "$(dirname "$0")/binary-dependencies.py" "${plugin_directory}" "${output_file}"
+  if [[ "$plugin_directory" == "my-browser" ]] && git cat-file -e "HEAD:my-browser/native-host/go.mod" 2>/dev/null; then
+    stage=$(mktemp -d)
+    trap 'rm -rf "$stage"' EXIT
+    git archive HEAD:my-browser/native-host | tar -x -C "$stage"
+    node scripts/build-browser-native.mjs "$stage" "$stage/package/native-host/bin"
+    absolute_output=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$output_file")
+    (cd "$stage/package" && zip -qr "$absolute_output" native-host/bin)
+  fi
+else
 
 git -c core.autocrlf=false archive \
   --format=zip \
@@ -30,6 +38,8 @@ git -c core.autocrlf=false archive \
   --add-file=TRADEMARKS.md \
   --add-file=TRADEMARKS.zh-CN.md \
   "HEAD:${plugin_directory}"
+
+fi
 
 # `git archive --format=zip` emits directory records. Remove them so local
 # packages have the same shape as published packages. The package cap applies

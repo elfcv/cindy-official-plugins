@@ -39,7 +39,7 @@ test('PDF reader bounds page translation before sending model requests',()=>{
 test('bridge learning access requires the paired extension challenge key and stays in the legacy port range',()=>{
   assert.match(bridge,/const pairedCredential\s*=/);
   assert.match(bridge,/const verifyProof\s*=/);
-  assert.match(bridge,/const authRequired=client\.version===manifest\.version/);
+  assert.match(bridge,/const authRequired=client\.version===WIRE_VERSION/);
   assert.match(bridge,/const learning = new Map\(\), learningChallenges = new Map\(\)/);
   assert.match(bridge,/h\['x-my-browser-session'\] !== client\.session/);
   assert.match(bridge,/x-my-browser-learning-challenge/);

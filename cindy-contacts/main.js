@@ -1911,14 +1911,29 @@ async function pushQa(contactId, entry) {
   await batch([setMetaStmt(`qa:${contactId}`, list.slice(-12))]);
 }
 
+/** 这个人页面上最近几轮问答，让「对」「帮我删了」这类接着上文的话有着落。 */
+async function recentTalk(contactId, n = 6) {
+  const lines = [];
+  for (const x of (await getQa(contactId)).slice(-n)) {
+    if (x.q) lines.push(`用户：${str(x.q).slice(0, 300)}`);
+    if (x.a) lines.push(`Cindy：${str(x.a).slice(0, 600)}`);
+  }
+  return lines.join('\n');
+}
+
+/** 快速通道判断出用户要动手（改档案、去查、发消息）时只回这个记号，改交给任务。 */
+const HANDOFF = '[[TASK]]';
+
 /** 只问这个人的事：把档案交给 Cindy 的快速通道，几秒出答案，不开任务。 */
-async function quickAsk(d, text) {
+async function quickAsk(d, text, talk) {
   const prompt = [
     `你是用户的私人通讯录助手。下面是用户通讯录里「${d.name}」的档案和往来记录。`,
     '只根据这些内容回答：第一句直接给结论，总共不超过 5 句；档案里没有的就说「档案里没有记录」，不要猜。用提问的语言回答。',
+    `你只能读、不能改。用户要你删除、修改、更正档案里的内容（包括关掉一条还没完的事、说某件事没发生），或者是对你上一句确认问题的肯定回答，或者要你去查邮件、聊天、日历、发消息、安排事情：不要再追问，只回复 ${HANDOFF} 这一个词。`,
     '',
-    dossierText(d).slice(0, 28000),
+    dossierText(d).slice(0, 26000),
     '',
+    ...(talk ? ['之前的对话：', talk, ''] : []),
     `用户的问题：${text}`,
   ].join('\n');
   const r = await cindy.send({ type: 'cindy-request', kind: 'oneshot_text', prompt });
@@ -2107,6 +2122,10 @@ function watchRun(entry) {
 }
 
 const DRAFT_RE = /(写|起草|拟|回).{0,8}(邮件|信|email)|草稿|draft|e-?mail/i;
+/** 删改档案的请求：快速通道只能读，直接交给能写档案的任务。 */
+const EDIT_RE =
+  // 只认明确要动手的说法；「不对」「错了」这类评价交给快速通道带着上文判断，真要改时它会转交。
+  /删|去掉|移除|改成|改为|改一下|更正|纠正|没这事|没有这回事|标记(成|为)|关掉|合并|\b(delete|remove|close|merge|didn'?t happen)\b|削除|消して|修正して|삭제|지워|수정해/i;
 const ACTION_RE =
   /回补|补全|往前补|去查|查一下|查查|搜一下|找一下|帮我(发|约|安排|问)|发给|提醒|\b(check|look ?up|search|find|backfill|schedule|remind|send|book|arrange)\b|調べ|探し|確認して|予定|送って|リマインド|찾아|확인해|검색|일정|보내|알려/i;
 
@@ -2123,13 +2142,21 @@ async function ask(input) {
   }
   const d = await getContact(contactId, { interactionLimit: 60, eventLimit: 30 });
   const wantsDraft = DRAFT_RE.test(text);
-  const useTask = input.mode === 'task' || wantsDraft || ACTION_RE.test(text);
+  const talk = await recentTalk(d.id);
+  // 问句（「她这样做不对吗？」）不按关键词直接交给会改档案的任务；快速通道带着上文，真要改时会转交。
+  // 句尾问号或语气词，或「删不删」「要不要」「是不是」这类正反问
+  const isQuestion = /[?？吗嘛呢]$/.test(text.replace(/[\s。.!！~～…]+$/, '')) || /(\S)不\1|要不要|是不是|该不该|能不能|需不需要/.test(text);
+  const useTask = input.mode === 'task' || wantsDraft || (EDIT_RE.test(text) && !isQuestion) || ACTION_RE.test(text);
   if (!useTask) {
     try {
-      const answer = await quickAsk(d, text);
-      const entry = { key: `quick@${nowIso()}`, q: text, a: answer, at: nowIso(), via: 'quick', status: 'done' };
-      await pushQa(d.id, entry);
-      return { kind: 'answer', ...entry };
+      const answer = await quickAsk(d, text, talk);
+      // 快速通道判断要动手：不记这句记号，改走任务
+      // 整句就是记号才转交；回答里引用到这个字面量不算
+      if (answer.replace(/^[\s`'"“”「」]+|[\s`'"“”「」。.]+$/g, '') !== HANDOFF) {
+        const entry = { key: `quick@${nowIso()}`, q: text, a: answer, at: nowIso(), via: 'quick', status: 'done' };
+        await pushQa(d.id, entry);
+        return { kind: 'answer', ...entry };
+      }
     } catch (e) {
       if (e.code !== 'NO_QUICK_MODEL') throw e;
       // 没有可用的快速通道：改走任务。
@@ -2137,8 +2164,10 @@ async function ask(input) {
   }
   const prompt = [
     `关于通讯录里的「${d.name}」（${CHANNEL} 档案 id：${d.id}）：${text}`,
+    ...(talk ? ['', '这句话接着人物页上之前的对话（「对」「帮我删了」这类指的就是上文说的那件事）：', talk] : []),
     '',
     `先用 ghost_call({ ghost_id: "${CHANNEL}", tool: "get", args: { id: "${d.id}" } }) 读这个人的档案和往来。`,
+    '只有用户明确要求删除、修改或更正（如「删了」「改成…」「关掉」，或对你上一句确认问题回答「对」）时才直接改，不要再问确认；用户只是在问要不要改、征求意见时，只回答和给建议，不改档案。要改时：还没完的事用 save 的 close_loops 关掉（id 来自 get，detail 写清是用户说没有这回事还是已完成），说错的内容用 save 改写；只有删除整个人才需要用户明确说要删这个人。改完一句话说改了什么。',
     wantsDraft
       ? '写邮件：用已安装的邮件插件只创建草稿，不要发送。回复已有往来时接在原邮件串里，并先确认这串往来在哪个邮箱账号里、用同一个账号。最终回复只写：草稿所在账号、收件人、主题和正文全文。'
       : '需要时去邮件、飞书、日历里查；查到的新往来用 record 记进档案，必要时用 save 更新 summary、narrative、latest 和还没完的事。最终回复简短，第一句给结论。',

@@ -2665,3 +2665,8 @@ License: https://raw.githubusercontent.com/naptha/tessdata/gh-pages/LICENSE
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+Go runtime and standard library 1.27.2 (native browser bootstrap executable)
+Source: https://go.dev/
+License: BSD-3-Clause; full text: native-host/GO-LICENSE
+No third-party Go modules. Built from native-host/ source with CGO disabled.

@@ -10,6 +10,11 @@
     const text = value.trim().toLowerCase();
     const exact = text.startsWith('=');
     const raw = exact ? text.slice(1) : text.replace(/^\*\./, '');
+    if (/^\[[0-9a-f:.]+\]$/.test(raw)) {
+      const host=new URL('https://'+raw).hostname;
+      if(isLocal(host))throw new Error('Local and private addresses are not supported.');
+      return (exact?'=':'')+host;
+    }
     if (!raw || /[\s/@:?#\\]/.test(raw)) throw new Error('Enter a domain only, without a URL, port or path.');
     const host = new URL('https://' + raw).hostname;
     if (host !== raw && !/[^\x00-\x7f]/.test(raw)) throw new Error('Invalid domain.');
@@ -18,16 +23,27 @@
     if (isLocal(host)) throw new Error('Local and private addresses are not supported.');
     return (exact ? '=' : '') + host;
   }
-  function isLocal(host) {
-    // IPv6 literals are deliberately unsupported, including mapped loopback/private addresses.
-    if (host.includes(':') || host.startsWith('[') || host === 'localhost' || host.endsWith('.localhost') ||
-        host.endsWith('.local') || host.endsWith('.internal') || !host.includes('.')) return true;
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-      const [a,b] = host.split('.').map(Number);
-      return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) ||
-        (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  function publicLiteral(ip) {
+    if (typeof ip !== 'string') return false;
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+      const [a,b] = ip.split('.').map(Number);
+      return a !== 0 && a !== 10 && a !== 127 && a < 224 && !(a === 169 && b === 254) &&
+        !(a === 172 && b >= 16 && b <= 31) && !(a === 192 && b === 168) && !(a === 100 && b >= 64 && b <= 127);
     }
-    return false;
+    try {
+      const host=new URL('http://['+ip+']/').hostname.slice(1,-1);
+      const [first,second]=host.split(':').map(x=>parseInt(x || '0',16));
+      return first>=0x2000 && first<=0x3fff && first!==0x2002 && first!==0x3fff &&
+        !(first===0x2001 && (second<0x200 || second===0xdb8));
+    } catch {return false;}
+  }
+  function isLocal(host) {
+    if (host === 'localhost' || host.endsWith('.localhost') ||
+        host.endsWith('.local') || host.endsWith('.internal')) return true;
+    const ip = host.startsWith('[') && host.endsWith(']') ? host.slice(1,-1) : host.includes(':') ? host :
+      /^\d+\.\d+\.\d+\.\d+$/.test(host) ? host : null;
+    if (ip) return !publicLiteral(ip);
+    return !host.includes('.');
   }
   function matches(host, pattern) {
     return pattern === '*' || (pattern.startsWith('=') ? host === pattern.slice(1) : host === pattern || host.endsWith('.' + pattern));

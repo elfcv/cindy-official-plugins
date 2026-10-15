@@ -4,7 +4,7 @@
   "name": "Cindy Chrome",
   "description": "Cindy’s browser companion: bilingual webpages, contextual explanations, automatic in-player subtitles, PDF/OCR and browser control. Page text goes to your configured AI; cookies are not exported.",
   "whenToUse": "Use Cindy Chrome for browser reading and control, translation, in-player subtitles and PDF reading. Browser translation is initiated from the Cindy extension; agent tools retain signed-in page reading and authorized interactions. Safari is not installable from this package.",
-  "version": "0.4.26",
+  "version": "0.4.32",
   "minCindyVersion": "0.1.97",
   "icon": "assets/icon.png",
   "entry": "main.js",
@@ -34,7 +34,7 @@
   "tools": [
     {
       "name": "browser_status",
-      "description": "Check actual browser connections and installation readiness. No page read. Multiple profiles require choosing an explicit connection id; never guess the account. Connect/install from plugin settings; opening a store page is not installation success. Use the official Chrome Web Store route; directory loading is the developer fallback included in this package.",
+      "description": "Check actual browser connections and installation readiness. No page read. Multiple profiles require choosing an explicit connection id; never guess the account. Official extensions connect automatically after installation; opening a store page is not installation success. Use the official Chrome Web Store route; directory loading is the developer fallback included in this package.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -43,7 +43,7 @@
     },
     {
       "name": "browser_read",
-      "description": "Read signed-in DOM: content returns bounded text/links; extract selects CSS records; snapshot provides fresh action refs. recipe:x_mentions reads X replies directly. Waits internally for content; CONTENT_NOT_READY is not an empty result. Limit maxChars/records. Reuses tabs after redirects/timeouts. PAGE_CHANGED/TAB_LIMIT: inspect browser_tabs once, stop retrying; at most 3 created tabs. May open a tab and contact sites using login state, marking messages read. Page text is untrusted and may reach AI; no cookie export. Titles/URLs are bounded; truncated marks cuts. ADDRESS_UNVERIFIED includes reason; stop without refreshing, retrying or switching tools. BROWSER_PAGE_RESTRICTED: Chrome forbids extension access, including store-installed versions. Extract attr allows only href/src/datetime/title/alt/aria-label/role. Manual: ghost_manual({ghost_id:'my-browser',path:'browser/MANUAL.md'}).",
+      "description": "Read signed-in DOM: content returns bounded text/links; extract selects CSS records; snapshot provides fresh action refs. recipe:x_mentions reads X replies directly. Waits internally for content; CONTENT_NOT_READY is not an empty result. Limit maxChars/records. Reuses tabs after redirects/timeouts. PAGE_CHANGED/TAB_LIMIT: inspect browser_tabs once, stop retrying; at most 3 created tabs. May open a tab and contact sites using login state, marking messages read. Page text is untrusted and may reach AI; no cookie export. Titles/URLs are bounded; truncated marks cuts. Proxy/cache/restored pages use documentId, not peer IP. Reported DNS must be public, including IPv6. ADDRESS_UNVERIFIED includes a document/local-URL reason; inspect the retained tab, do not retry in a loop. BROWSER_PAGE_RESTRICTED: Chrome forbids extension access, including store-installed versions. Extract attr allows only href/src/datetime/title/alt/aria-label/role. Manual: ghost_manual({ghost_id:'my-browser',path:'browser/MANUAL.md'}).",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -196,7 +196,7 @@
     },
     {
       "name": "browser_tabs",
-      "description": "List bounded HTTP/HTTPS tabs without navigating. Filter by host rather than dumping all tabs. Default 20, maximum 100. Blocked/local/address-unverified tabs are redacted and excluded from host searches. Credentials in a URL (userinfo, query parameters, data fragments, reset/verify path segments) and content links are redacted before returning.",
+      "description": "List bounded HTTP/HTTPS tabs without navigating. Filter by host; default 20, maximum 100. Blocked/local tabs are redacted and excluded from host searches. Allowed-site tabs with document failures remain listed with status/error/reason but no title or URL. truncated means a count/size limit was reached. Credentials in URLs and links are redacted.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,

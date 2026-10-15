@@ -12,30 +12,29 @@ const root=path.resolve(import.meta.dirname,'../my-browser');
 const {createBridge}=require('../my-browser/node/bridge.cjs');
 const P=require('../my-browser/extension/policy.js');
 const enabled=!!process.env.PLAYWRIGHT_CORE;
-test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negative paths',{skip:!enabled,timeout:120000},async t=>{
+for (const autoConnectOnly of [true,false]) test(autoConnectOnly ? 'real Chrome: auto-connect and reconnect without pairing UI' : 'real Chrome: sandbox messages → Node → MV3 → DOM, settings and negative paths',{skip:!enabled,timeout:120000},async t=>{
   const {chromium}=require(process.env.PLAYWRIGHT_CORE);
   const profile=await fs.mkdtemp(path.join(os.tmpdir(),'my-browser-test-'));let context;
   t.after(async()=>{await context?.close();await fs.rm(profile,{recursive:true,force:true,maxRetries:3});});
   const extensionDir=path.join(profile,'unpacked-extension');await fs.cp(path.join(root,'extension'),extensionDir,{recursive:true});
-  // Fixture transport uses loopback/proxy interception. Simulate PUBLIC peer evidence
-  // only for named positive fixtures at the browser API boundary; private.test keeps
-  // the real loopback address. Production guard and document binding run unchanged.
-  const networkShim=`const nativeCompleted=chrome.webRequest.onCompleted.addListener.bind(chrome.webRequest.onCompleted);
-  chrome.webRequest.onCompleted.addListener=(fn,...args)=>nativeCompleted(d=>fn(['example.test','blocked.test','redirect.test','huge.test','long.test','cv.test','links.test','manylinks.test','pageurl.test','x.com'].includes(new URL(d.url).hostname)?{...d,ip:'8.8.8.8'}:d),...args);\n`;
-  const backgroundPath=path.join(extensionDir,'background.js');
-  await fs.writeFile(backgroundPath,networkShim+await fs.readFile(backgroundPath,'utf8'));
+  // Real loopback proxy transport. No IP rewriting: exercise the production
+  // document guard with the same proxy endpoint that caused PEER_NOT_PUBLIC.
   const {generateKeyPairSync,createHash}=require('node:crypto');
   const {publicKey}=generateKeyPairSync('rsa',{modulusLength:2048,publicKeyEncoding:{type:'spki',format:'der'}});
   const extensionId=createHash('sha256').update(publicKey).digest('hex').slice(0,32).replace(/[0-9a-f]/g,c=>String.fromCharCode(97+parseInt(c,16)));
   const extensionManifest=JSON.parse(await fs.readFile(path.join(extensionDir,'manifest.json'),'utf8'));
   await fs.writeFile(path.join(extensionDir,'manifest.json'),JSON.stringify({...extensionManifest,key:publicKey.toString('base64')}));
-  const bridge=createBridge({ports:[18819],extensionId});t.after(()=>bridge.close());
-  await bridge.request('status'); // Fail before launching Chrome if the isolated test port is occupied.
+  const nativeProfiles=[profile,...['BraveSoftware/Brave-Browser','Google/Chrome','Google/Chrome for Testing'].map(p=>path.join(profile,'Library/Application Support',p))];
+  for(const p of nativeProfiles)await fs.mkdir(p,{recursive:true});
+  const native=require('../my-browser/node/native-binding.cjs').createNativeBinding({root:path.join(profile,'native'),profiles:nativeProfiles,binary:process.env.CINDY_NATIVE_TEST_BINARY});
+  let bridge=createBridge({ports:[18819],extensionId,nativeToken:native.token});t.after(async()=>{await bridge.close();await native.close();});
+  await bridge.request('status');assert.equal((await native.install(18819,[extensionId])).ok,true); // Fail before launching Chrome if the isolated test port is occupied.
   const installCalls=[];
   const installation=require('../my-browser/node/installation.cjs').createInstallation({platform:'darwin',exists:p=>p.includes('Chrome') || p.includes('Safari'),run:async(...args)=>installCalls.push(args)});
   let cfg={policy:{read:{block:[]},interact:{allow:[],block:[]}}};const faults={read:false,save:false,wake:false};
   const server=http.createServer(async(req,res)=>{
     try{
+      if(req.headers.host?.startsWith('slow.test')){res.setHeader('Content-Type','text/html');if(req.url==='/slow.png')return;return res.end('<title>Slow resource</title><p>Ready before the image</p><img src="/slow.png">');}
       if(req.headers.host?.startsWith('example.test') || req.headers.host?.startsWith('private.test')){res.setHeader('Content-Type','text/html');return res.end(fixture);}
       if(req.headers.host?.startsWith('manylinks.test')){res.setHeader('Content-Type','text/html');
         return res.end('<title>Many links</title><p>body</p>'+Array.from({length:20000},(_,i)=>'<a href="/m'+i+'">M</a>').join(''));}
@@ -53,7 +52,7 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
       if(req.headers.host?.startsWith('redirect.test')){res.writeHead(302,{Location:'http://blocked.test/'});return res.end();}
       let data='';for await(const c of req)data+=c;
       const json=value=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(value));};
-      if(req.url==='/node-request'){const v=JSON.parse(data);return json({ok:true,result:v.method==='installation'?{ok:true,...installation.status()}:v.method==='openInstallation'?await installation.open(v.params.browser,v.params.mode):await bridge.request(v.method,v.params)});}
+      if(req.url==='/node-request'){const v=JSON.parse(data);return json({ok:true,result:v.method==='status'&&faults.disconnected?{...await bridge.request('status'),extension_connected:false,clients:[],nativeBinding:faults.nativeUnavailable?'unavailable':'ready'}:v.method==='installation'?{ok:true,...installation.status()}:v.method==='openInstallation'?await installation.open(v.params.browser,v.params.mode):await bridge.request(v.method,v.params)});}
       if(req.url==='/kv'){
         if((req.method==='GET'&&faults.read)||(req.method==='PUT'&&faults.save)){res.statusCode=503;return json({});}
         if(req.method==='PUT'){cfg=JSON.parse(data);res.statusCode=204;return res.end();}return json(cfg);
@@ -89,7 +88,7 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
   });
   proxy.on('connect',(_req,socket)=>{socket.on('error',()=>{});socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');});
   await new Promise(r=>proxy.listen(0,'127.0.0.1',r));t.after(()=>{proxy.closeAllConnections();proxy.close();});
-  context=await chromium.launchPersistentContext(profile,{channel:'chromium',...(process.env.CHROMIUM_PATH?{executablePath:process.env.CHROMIUM_PATH}:{}),headless:true,args:['--proxy-server=http://127.0.0.1:'+proxy.address().port,'--proxy-bypass-list=<-loopback>','--disable-extensions-except='+extensionDir,'--load-extension='+extensionDir]});
+  context=await chromium.launchPersistentContext(profile,{channel:'chromium',...(process.env.CHROMIUM_PATH?{executablePath:process.env.CHROMIUM_PATH}:{}),headless:true,env:{...process.env,HOME:profile,CFFIXED_USER_HOME:profile},args:['--proxy-server=http://127.0.0.1:'+proxy.address().port,'--proxy-bypass-list=<-loopback>','--disable-extensions-except='+extensionDir,'--load-extension='+extensionDir]});
   const fixture=await fs.readFile(path.join(import.meta.dirname,'fixtures/my-browser-page.html'),'utf8');
   await context.route('http://example.test/**',route=>route.fulfill({status:200,contentType:'text/html',body:fixture}));
   await context.route('http://blocked.test/**',route=>route.fulfill({status:200,contentType:'text/html',body:'<h1>Blocked fixture</h1>'}));
@@ -107,11 +106,48 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
   await tool('browser_status');
   const until=Date.now()+15000;let status;
   do{status=await tool('browser_status');if(status.extension_connected)break;await new Promise(r=>setTimeout(r,300));}while(Date.now()<until);
-  assert.equal(status.extension_connected,true,'MV3 connected: '+JSON.stringify({status,workers:await Promise.all(context.serviceWorkers().map(sw=>sw.evaluate(async()=>({connection:await chrome.storage.session.get('connection'),id:chrome.runtime.id}))))}));
+  if(!status.extension_connected)assert.equal(status.extension_connected,true,'MV3 connected: '+JSON.stringify({status,workers:await Promise.all(context.serviceWorkers().map(sw=>sw.evaluate(async()=>({connection:await chrome.storage.session.get('connection'),id:chrome.runtime.id,native:await Promise.race([chrome.runtime.sendNativeMessage('com.makecindy.browser',{}).catch(e=>({error:e.message})),new Promise(r=>setTimeout(()=>r({error:'test timeout'}),5000))])}))))}));
+  assert.equal(cfg.pairedClients,undefined);assert.equal(await logic.evaluate(()=>window.confirmCount),0);
   assert.equal('policy' in status,false);assert.equal('extension_dir' in status,false);assert.equal('port' in status,false);
   assert.equal('origin' in status.clients[0],false);assert.equal('extensionId' in status.clients[0],false);
   assert.ok(status.clients[0].id);assert.equal(status.installation.browsers[0].browser,'chrome');
-  const connection=await context.serviceWorkers()[0].evaluate(()=>chrome.storage.session.get('connection'));assert.equal(connection.connection.connected,true);
+  const worker=context.serviceWorkers()[0];
+  for(let deadline=Date.now()+5000;Date.now()<deadline;){
+    if((await worker.evaluate(()=>chrome.storage.session.get('connection'))).connection?.connected)break;
+    await new Promise(resolve=>setTimeout(resolve,100));
+  }
+  const connection=await worker.evaluate(()=>chrome.storage.session.get('connection'));assert.equal(connection.connection.connected,true);
+  if(autoConnectOnly) {
+    const settings=await context.newPage();await settings.goto(base+'/');
+    await settings.getByText('浏览器已连接',{exact:true}).waitFor();
+    assert.equal(await settings.locator('#profiles button').count(),0);
+    assert.equal(await settings.getByRole('button',{name:'确认连接',exact:true}).count(),0);
+    assert.equal(cfg.pairedClients,undefined);
+    await bridge.close();bridge=createBridge({ports:[18819],extensionId,nativeToken:native.token});await bridge.request('status');
+    const deadline=Date.now()+20000;
+    do {status=await tool('browser_status');if(status.extension_connected)break;await new Promise(r=>setTimeout(r,300));}while(Date.now()<deadline);
+    assert.equal(status.extension_connected,true,'extension reconnects after the bridge restarts');
+    await settings.reload();await settings.getByText('浏览器已连接',{exact:true}).waitFor();
+    assert.equal(await logic.evaluate(()=>window.confirmCount),0);
+    assert.equal(cfg.pairedClients,undefined);assert.equal(installCalls.length,0);
+    assert.deepEqual(cfg.policy,{read:{block:[]},interact:{allow:[],block:[]}});
+    for(const supported of [true,false]) {
+      const candidate={id:crypto.randomUUID(),origin:supported?'chrome-extension://'+extensionId:'safari-web-extension://'+crypto.randomUUID()};
+      await fetch('http://127.0.0.1:'+(await bridge.request('status')).port+'/health',{headers:{'X-My-Browser-Extension':extensionId,'X-My-Browser-Origin':candidate.origin,'X-My-Browser-Client':candidate.id,'X-My-Browser-Version':'0.4.13','X-My-Browser-Installed-Version':'0.4.16'}});
+      await settings.locator('#refresh').click();await settings.waitForFunction(()=>!document.querySelector('#refresh').disabled);
+      const row=settings.locator('.profile').filter({hasText:candidate.id.slice(0,8)});
+      assert.equal(await row.locator('button').count(),0);
+      assert.match(await row.textContent(),supported?/正在检查连接/:/不支持此扩展.*Chrome 网上应用店/);
+      const profile=(await tool('browser_status')).clients.find(c=>c.id===candidate.id);
+      assert.equal(profile.identitySupported,supported);assert.equal(profile.connected,false);
+    }
+    faults.disconnected=true;faults.nativeUnavailable=true;await settings.locator('#refresh').click();
+    await settings.getByText('自动连接组件准备失败。请重新启用 Cindy Chrome；若仍失败，请查看插件运行日志。',{exact:true}).waitFor();
+    faults.disconnected=false;faults.nativeUnavailable=false;await settings.locator('#refresh').click();await settings.getByText('浏览器已连接',{exact:true}).waitFor();
+    assert.deepEqual(errors,[]);
+    if(process.env.MY_BROWSER_SCREENSHOT)await settings.screenshot({path:process.env.MY_BROWSER_SCREENSHOT,fullPage:true});
+    return;
+  }
   // Establish interception before this page's first request (extension-created targets may navigate before Playwright attaches).
   const xPage=await context.newPage();await xPage.goto('https://x.com/notifications/mentions');
   const started=Date.now();const mentions=await tool('browser_read',{recipe:'x_mentions',limit:5,maxChars:2000});
@@ -119,10 +155,18 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
   const bytes=Buffer.byteLength(JSON.stringify(mentions));assert.ok(bytes<3000);
   t.diagnostic('X mentions fixture: '+JSON.stringify({browserReadCalls:1,elapsedMs:Date.now()-started,resultBytes:bytes,records:mentions.count}));
   const incremental=await tool('browser_read',{recipe:'x_mentions',after:'https://example.test/post/2',limit:5});assert.equal(incremental.records.length,2);assert.equal(incremental.cursorFound,true);
-  const privatePage=await context.newPage();await privatePage.goto('http://private.test/');
-  const denied=await tool('browser_read',{url:'http://private.test/',mode:'text'});
-  assert.equal(denied.error,'ADDRESS_UNVERIFIED',JSON.stringify(denied));assert.equal(denied.text,undefined);
-  assert.deepEqual((await tool('browser_tabs',{host:'private.test'})).tabs,[]);await privatePage.close();
+  const proxiedPage=await context.newPage();await proxiedPage.goto('http://private.test/');
+  const proxied=await tool('browser_read',{url:'http://private.test/',mode:'text'});
+  assert.equal(proxied.ok,true,JSON.stringify(proxied));assert.ok(proxied.text);
+  assert.equal((await tool('browser_tabs',{host:'private.test'})).tabs.length,1);
+  const local=await tool('browser_read',{url:'http://127.0.0.1/private',mode:'text'});
+  assert.equal(local.ok,false);assert.equal(local.text,undefined);
+  await proxiedPage.close();
+  const slow=await context.newPage();await slow.goto('http://slow.test/',{waitUntil:'domcontentloaded'});
+  const slowStart=Date.now(),slowRead=await tool('browser_read',{url:'http://slow.test/',mode:'text'});
+  assert.equal(slowRead.ok,true,JSON.stringify(slowRead));assert.match(slowRead.text,/Ready before the image/);
+  assert.ok(Date.now()-slowStart<15000,'DOM-ready page must not wait on the stalled image');
+  await slow.close();
   const url='http://example.test/';
   const page=await context.newPage();await page.goto(url);
   // A normal/double click must not leave a floating Cindy entry over arbitrary page text.
@@ -135,7 +179,7 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
   await page.evaluate(()=>document.querySelector('[data-cindy-selection-entry]')?.remove());
   let r=await tool('browser_read',{url,mode:'text'});assert.equal(r.ok,true,JSON.stringify(r));assert.match(r.text,/Visible fixture text/);
   // Terminate and restart the real MV3 worker, keeping the browser and page.
-  // A new worker must recover exact-document evidence from session storage.
+  // A new worker must use current browser document identity without an IP receipt.
   const cdp=await context.newCDPSession(page);let workerVersion;
   cdp.on('ServiceWorker.workerVersionUpdated',({versions})=>{
     const v=versions.find(v=>v.scriptURL==='chrome-extension://'+extensionId+'/background.js');
@@ -145,13 +189,6 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
   const versionDeadline=Date.now()+3000;
   while(!workerVersion && Date.now()<versionDeadline)await new Promise(r=>setTimeout(r,25));
   assert.ok(workerVersion,'Chrome reports the running extension service worker');
-  await context.serviceWorkers()[0].evaluate(async()=>{
-    const deadline=Date.now()+3000;
-    while(!(await chrome.storage.session.get('verifiedNetworkDocuments')).verifiedNetworkDocuments?.length){
-      if(Date.now()>deadline)throw Error('Verified document receipt not saved');
-      await new Promise(r=>setTimeout(r,25));
-    }
-  });
   await cdp.send('ServiceWorker.stopWorker',{versionId:workerVersion});
   // Native extension messaging wakes a suspended worker. CDP startWorker does
   // not perform Chrome's extension lazy-event activation on all supported builds.
@@ -429,11 +466,19 @@ test('real Chrome: sandbox messages → Node → MV3 → DOM, settings and negat
   await settings.setViewportSize({width:330,height:740});assert.equal(await settings.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   if(process.env.MY_BROWSER_SCREENSHOT)await settings.screenshot({path:process.env.MY_BROWSER_SCREENSHOT,fullPage:true});
   const candidate={id:crypto.randomUUID(),origin:'safari-web-extension://'+crypto.randomUUID(),extensionId};
-  await fetch('http://127.0.0.1:'+(await bridge.request('status')).port+'/health',{headers:{'X-My-Browser-Extension':candidate.extensionId,'X-My-Browser-Origin':candidate.origin,'X-My-Browser-Client':candidate.id,'X-My-Browser-Version':status.version,'X-My-Browser-Family':'safari'}});
-  await logic.evaluate(()=>window.confirmAllowed=false);await settings.locator('#refresh').click();await settings.getByRole('button',{name:'确认连接',exact:true}).click();await settings.getByText('No browser was authorized.',{exact:true}).waitFor();assert.equal(cfg.pairedClients,undefined);
-  await logic.evaluate(()=>window.confirmAllowed=true);await settings.getByRole('button',{name:'确认连接',exact:true}).click();await settings.waitForFunction(()=>!document.querySelector('#profiles button'));assert.equal(cfg.pairedClients[0].id,candidate.id);assert.ok(cfg.policy.read.block.includes('new-block.test'));
+  await fetch('http://127.0.0.1:'+(await bridge.request('status')).port+'/health',{headers:{'X-My-Browser-Extension':candidate.extensionId,'X-My-Browser-Origin':candidate.origin,'X-My-Browser-Client':candidate.id,'X-My-Browser-Version':'0.4.13','X-My-Browser-Installed-Version':'0.4.16','X-My-Browser-Family':'safari'}});
+  const confirmations=await logic.evaluate(()=>window.confirmCount);
+  await logic.evaluate(()=>window.confirmAllowed=false);await settings.locator('#refresh').click();
+  await settings.waitForFunction(()=>!document.querySelector('#refresh').disabled);
+  assert.equal(await settings.locator('#profiles button').count(),0);
+  assert.equal(await settings.getByRole('button',{name:'确认连接',exact:true}).count(),0);
+  assert.equal(await logic.evaluate(()=>window.confirmCount),confirmations);
+  assert.equal(cfg.pairedClients,undefined);assert.ok(cfg.policy.read.block.includes('new-block.test'));
+  assert.equal((await bridge.request('status')).clients.find(c=>c.id===candidate.id).connected,false);
+  faults.disconnected=true;await settings.locator('#refresh').click();
   await settings.locator('.browser-card').filter({has:settings.getByText('Chrome',{exact:true})}).getByRole('button',{name:'安装浏览器扩展'}).click();
-  await settings.getByText('请在浏览器完成确认，本页会自动检查连接。',{exact:true}).waitFor();
+  await settings.getByText('请在浏览器完成扩展安装，随后会自动连接。',{exact:true}).waitFor();
+  faults.disconnected=false;
   assert.equal(installCalls.length,1);assert.equal(installCalls[0][1][2],'https://chromewebstore.google.com/detail/cindy/dmbhhhdijpeaibfeocdcjhfefkgpkeef');
   await logic.evaluate(()=>window.confirmAllowed=false);
   await settings.locator('#all-sites').check();await settings.locator('#save').click();await settings.locator('#hint.error').waitFor();
