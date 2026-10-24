@@ -170,7 +170,10 @@ function sanitizeMailArgs(args) {
   }
 
   if (action === 'search') {
-    ['text', 'from', 'to', 'subject', 'since', 'before'].forEach(function copyString(key) {
+    if (args.page_token !== undefined && (typeof args.page_token !== 'string' || !args.page_token.trim())) {
+      throw new Error('page_token必须是上一页返回的非空翻页标记；查第一页时省略');
+    }
+    ['text', 'from', 'to', 'subject', 'since', 'before', 'page_token', 'text_scope'].forEach(function copyString(key) {
       if (typeof args[key] === 'string' && args[key].trim()) output[key] = args[key].trim();
     });
     if (typeof args.unread === 'boolean') output.unread = args.unread;
@@ -216,7 +219,7 @@ async function runMail(args, callId) {
     var result = await nodeRequest('mail/action', {
       email: email,
       action: action,
-    }, ['send', 'draft', 'read'].includes(action.action) ? 120000 : 45000, callId);
+    }, ['send', 'draft', 'read', 'search'].includes(action.action) ? 120000 : 45000, callId);
     return { ok: true, result: result };
   } catch (error) {
     if (['send', 'draft', 'move', 'mark_read', 'mark_unread'].includes(action.action)) {

@@ -20,6 +20,8 @@ const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
 const MAX_BODY_CHARS = 20000;
 const MAX_SOURCE_BYTES = 48 * 1024 * 1024;
+const MAX_SEARCH_CANDIDATES = 10000;
+const METADATA_BATCH_SIZE = 200;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SECRET_KEY = 'qq_mail_authorization_code';
 
@@ -70,22 +72,35 @@ function normalizeRecipients(value, required) {
 
 function parseSearchDate(value, field) {
   if (value === undefined) return undefined;
-  const date = new Date(value);
+  if (typeof value !== 'string') throw new Error(`INVALID_${field.toUpperCase()}`);
+  const dayOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+  const calendar = new Date(value.slice(0, 10) + 'T00:00:00Z');
+  if (!Number.isFinite(calendar.getTime()) || calendar.toISOString().slice(0, 10) !== value.slice(0, 10)) {
+    throw new Error(`INVALID_${field.toUpperCase()}`);
+  }
+  if (!dayOnly && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
+    throw new Error(`INVALID_${field.toUpperCase()}`);
+  }
+  const date = new Date(dayOnly ? value + 'T00:00:00+08:00' : value);
   if (Number.isNaN(date.getTime())) throw new Error(`INVALID_${field.toUpperCase()}`);
   return date;
 }
 
 function buildSearchCriteria(action) {
   const criteria = {};
-  if (typeof action.from === 'string' && action.from.trim()) criteria.from = action.from.trim();
-  if (typeof action.to === 'string' && action.to.trim()) criteria.to = action.to.trim();
-  if (typeof action.subject === 'string' && action.subject.trim()) criteria.subject = action.subject.trim();
-  if (typeof action.unread === 'boolean') criteria.seen = !action.unread;
+  // QQ's header search can miss known matches. Fetch only metadata and apply
+  // from/to/subject/seen locally, before counting and paginating the results.
   const since = parseSearchDate(action.since, 'since');
   const before = parseSearchDate(action.before, 'before');
-  if (since) criteria.since = since;
-  if (before) criteria.before = before;
-  if (typeof action.text === 'string' && action.text.trim()) {
+  if (since && before && since >= before) throw new Error('INVALID_SEARCH_RANGE');
+  // IMAP calendar dates do not represent hours or timezone boundaries. Use
+  // padded day strings for a superset; exact INTERNALDATE filtering is local.
+  if (since) criteria.since = new Date(since.getTime() - 86400000).toISOString().slice(0, 10);
+  if (before) criteria.before = new Date(before.getTime() + 2 * 86400000).toISOString().slice(0, 10);
+  if (action.text_scope !== undefined && !['metadata', 'full'].includes(action.text_scope)) {
+    throw new Error('INVALID_TEXT_SCOPE');
+  }
+  if (action.text_scope !== 'metadata' && typeof action.text === 'string' && action.text.trim()) {
     const text = action.text.trim();
     criteria.or = [
       { subject: text },
@@ -123,6 +138,7 @@ function summaryFromMessage(message, folder) {
     date: (envelope.date || message.internalDate || null)
       ? new Date(envelope.date || message.internalDate).toISOString()
       : null,
+    received_at: message.internalDate ? new Date(message.internalDate).toISOString() : null,
     unread: !flags.includes('\\Seen'),
     flagged: flags.includes('\\Flagged'),
     size: Number.isFinite(message.size) ? message.size : null,
@@ -246,24 +262,105 @@ async function listFolders(credentials, deps) {
 
 async function search(credentials, action, deps) {
   const folder = action.folder || 'INBOX';
+  const criteria = buildSearchCriteria(action);
+  const since = parseSearchDate(action.since, 'since');
+  const before = parseSearchDate(action.before, 'before');
+  const fold = value => String(value || '').normalize('NFKC').toLowerCase();
+  const queryHash = createHash('sha256').update(JSON.stringify({
+    email: credentials.email.toLowerCase(), folder,
+    since: since ? since.toISOString() : null, before: before ? before.toISOString() : null,
+    from: fold(action.from).trim(), to: fold(action.to).trim(), subject: fold(action.subject).trim(),
+    unread: typeof action.unread === 'boolean' ? action.unread : null,
+    text: typeof action.text === 'string' ? action.text.trim() : '', text_scope: action.text_scope || 'full',
+  })).digest('hex');
+  let cursor;
+  if (action.page_token !== undefined) {
+    try {
+      if (typeof action.page_token !== 'string' || !/^[A-Za-z0-9_-]{1,1024}$/.test(action.page_token)) throw new Error();
+      cursor = JSON.parse(Buffer.from(action.page_token, 'base64url').toString('utf8'));
+      if (cursor.v !== 1 || cursor.q !== queryHash || typeof cursor.validity !== 'string'
+        || !Number.isInteger(cursor.high) || cursor.high < 1 || cursor.high > 0xffffffff
+        || !Number.isInteger(cursor.before) || cursor.before < 1 || cursor.before > cursor.high) throw new Error();
+    } catch (_error) { throw new Error('INVALID_PAGE_TOKEN'); }
+  }
   const maxResults = Number.isInteger(action.max_results)
     ? Math.min(20, Math.max(1, action.max_results))
     : 10;
   return withImap(credentials, deps, (client) => withMailbox(client, folder, async () => {
-    const uids = await client.search(buildSearchCriteria(action), { uid: true });
-    const selected = uids.slice(-maxResults).reverse();
-    if (selected.length === 0) return { folder, total: 0, messages: [] };
-    const messages = await client.fetchAll(
-      selected,
-      { uid: true, envelope: true, flags: true, internalDate: true, size: true },
-      { uid: true },
-    );
-    const byUid = new Map(messages.map((message) => [message.uid, message]));
+    const validity = client.mailbox && client.mailbox.uidValidity != null ? String(client.mailbox.uidValidity) : null;
+    if (cursor && cursor.validity !== validity) throw new Error('PAGE_TOKEN_MAILBOX_CHANGED');
+    const found = await client.search(criteria, { uid: true });
+    if (!Array.isArray(found)) throw new Error('SEARCH_UNAVAILABLE');
+    const candidates = [...new Set(found)].sort((a, b) => b - a);
+    if (candidates.some(uid => !Number.isInteger(uid) || uid < 1 || uid > 0xffffffff)) throw new Error('SEARCH_UNAVAILABLE');
+    const high = cursor ? cursor.high : (candidates[0] || 0);
+    const uids = candidates.filter(uid => uid <= high);
+    const localScan = !!(since || before || typeof action.unread === 'boolean'
+      || ['from', 'to', 'subject'].some(key => typeof action[key] === 'string' && action[key].trim())
+      || (action.text_scope === 'metadata' && typeof action.text === 'string' && action.text.trim()));
+    const fullText = typeof action.text === 'string' && action.text.trim() && action.text_scope !== 'metadata';
+    // Keep unfiltered/latest-mail queries cheap even for very large mailboxes.
+    if (!localScan) {
+      const remaining = cursor ? uids.filter(uid => uid < cursor.before) : uids;
+      const selected = remaining.slice(0, maxResults);
+      const fetched = selected.length ? await client.fetchAll(selected,
+        { uid: true, envelope: true, flags: true, internalDate: true, size: true }, { uid: true }) : [];
+      const byUid = new Map(fetched.filter(message => selected.includes(message.uid)).map(message => [message.uid, message]));
+      const messages = selected.filter(uid => byUid.has(uid)).map(uid => summaryFromMessage(byUid.get(uid), folder));
+      const hasMore = remaining.length > selected.length;
+      if (hasMore && validity === null) throw new Error('MAILBOX_STATE_UNAVAILABLE');
+      const next = hasMore ? Buffer.from(JSON.stringify({ v: 1, q: queryHash, validity, high,
+        before: selected[selected.length - 1] })).toString('base64url') : null;
+      return { folder, total: uids.length, returned: messages.length, messages, has_more: hasMore,
+        next_page_token: next, coverage_complete: !fullText && byUid.size === selected.length,
+        total_is_exact: !fullText && byUid.size === selected.length,
+        server_candidate_total: uids.length, metadata_scanned: byUid.size,
+        missing_metadata_count: selected.length - byUid.size, missing_date_count: 0,
+        uid_validity: validity, snapshot_max_uid: high, date_basis: 'received_at',
+        ...(fullText ? { search_warning: '全文搜索依赖 QQ 服务器，可能漏搜；完整检查请不传 text，或使用 text_scope:metadata 只查标题和地址。' } : {}) };
+    }
+    if (uids.length > MAX_SEARCH_CANDIDATES) throw new Error('SEARCH_TOO_BROAD');
+    const byUid = new Map();
+    for (let offset = 0; offset < uids.length; offset += METADATA_BATCH_SIZE) {
+      const batch = uids.slice(offset, offset + METADATA_BATCH_SIZE);
+      const fetched = await client.fetchAll(batch,
+        { uid: true, envelope: true, flags: true, internalDate: true, size: true }, { uid: true });
+      for (const message of fetched) if (batch.includes(message.uid)) byUid.set(message.uid, message);
+    }
+    let missingDates = 0;
+    const summaries = uids.filter(uid => byUid.has(uid)).map(uid => summaryFromMessage(byUid.get(uid), folder));
+    const matches = summaries.filter(message => {
+      if (since || before) {
+        const received = message.received_at && Date.parse(message.received_at);
+        if (!Number.isFinite(received)) { missingDates++; return false; }
+        if ((since && received < since.getTime()) || (before && received >= before.getTime())) return false;
+      }
+      for (const key of ['from', 'to', 'subject']) {
+        if (typeof action[key] === 'string' && action[key].trim() && !fold(message[key]).includes(fold(action[key]).trim())) return false;
+      }
+      if (typeof action.unread === 'boolean' && message.unread !== action.unread) return false;
+      if (action.text_scope === 'metadata' && typeof action.text === 'string' && action.text.trim()
+        && !['from', 'to', 'subject'].some(key => fold(message[key]).includes(fold(action.text).trim()))) return false;
+      return true;
+    });
+    const remaining = cursor ? matches.filter(message => message.uid < cursor.before) : matches;
+    const messages = remaining.slice(0, maxResults);
+    const hasMore = remaining.length > messages.length;
+    if (hasMore && validity === null) throw new Error('MAILBOX_STATE_UNAVAILABLE');
+    const next = hasMore ? Buffer.from(JSON.stringify({ v: 1, q: queryHash, validity, high,
+      before: messages[messages.length - 1].uid })).toString('base64url') : null;
+    const missingMetadata = uids.length - byUid.size;
     return {
       folder,
-      total: uids.length,
-      messages: selected.map((uid) => byUid.get(uid)).filter(Boolean)
-        .map((message) => summaryFromMessage(message, folder)),
+      total: matches.length, returned: messages.length, messages,
+      has_more: hasMore, next_page_token: next,
+      coverage_complete: !fullText && missingMetadata === 0 && missingDates === 0,
+      total_is_exact: !fullText && missingMetadata === 0 && missingDates === 0,
+      server_candidate_total: uids.length, metadata_scanned: byUid.size,
+      missing_metadata_count: missingMetadata, missing_date_count: missingDates,
+      uid_validity: validity, snapshot_max_uid: high,
+      date_basis: 'received_at',
+      ...(fullText ? { search_warning: '全文搜索依赖 QQ 服务器，可能漏搜；完整检查请不传 text，或使用 text_scope:metadata 只查标题和地址。' } : {}),
     };
   }));
 }
@@ -575,6 +672,12 @@ function humanizeError(error) {
   const code = error && error.code ? String(error.code) : '';
   const message = error && error.message ? String(error.message) : String(error || '');
   const combined = `${code} ${message}`.toLowerCase();
+
+  if (message === 'SEARCH_TOO_BROAD') return '查询范围过大，超过10000封候选邮件；请加上或缩小since/before日期范围后重试，尚未完成覆盖';
+  if (message === 'INVALID_PAGE_TOKEN') return '翻页标记无效或与邮箱、文件夹、筛选条件不一致；请保持原条件继续，或重新查询第一页';
+  if (message === 'PAGE_TOKEN_MAILBOX_CHANGED') return '邮箱UID有效期已变化，旧翻页标记不可继续；请重新查询第一页';
+  if (message === 'MAILBOX_STATE_UNAVAILABLE' || message === 'SEARCH_UNAVAILABLE') return '无法确认完整查询或翻页状态；本次检查未完成，不能视为没有邮件';
+  if (/^INVALID_(SINCE|BEFORE|SEARCH_RANGE|TEXT_SCOPE)$/.test(message)) return '查询参数无效：日期用YYYY-MM-DD（UTC+8）或带时区的ISO时间，since必须早于before；text_scope为metadata或full';
 
   if (message === 'INVALID_ATTACHMENT_PATHS') return '附件须使用本机文件绝对路径列表，每封最多 10 个文件';
   if (message === 'ATTACHMENT_UNREADABLE' || message === 'ATTACHMENT_NOT_FILE') return '附件不存在、无法读取或不是普通文件；邮件未发送，请检查文件路径';

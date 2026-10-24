@@ -7,7 +7,7 @@
       "description": "QQメールが設定済みか確認します。メールアドレスと接続状態だけを返し、認証コードは返しません。"
     },
     "qq_mail": {
-      "description": "QQ Mail の IMAP/SMTP 検索とメール操作。send/draft の attachment_paths は明示的に許可された Cindy 実行端末の絶対パスのみ。通常ファイル最大10個、合計32 MiB。元ファイルは変更せず、smtp.qq.com で送信、imap.qq.com で下書き保存。send/draft/read は添付名・バイト数・SHA-256 を返し、read はファイルをダウンロードしない。トップレベルの dir/attachments は使わない。送信・変更にはユーザーの明示的な依頼が必要。結果が不明なら再試行前にメールボックスを確認する。 read は本文と MIME を含むエンコード済みメールが 48 MiB を超えると拒否します。先に search が返す size を確認してください。"
+      "description": "QQ Mail の IMAP/SMTP 検索とメール操作。send/draft の attachment_paths は明示的に許可された Cindy 実行端末の絶対パスのみ。通常ファイル最大10個、合計32 MiB。元ファイルは変更せず、smtp.qq.com で送信、imap.qq.com で下書き保存。send/draft/read は添付名・バイト数・SHA-256 を返し、read はファイルをダウンロードしない。トップレベルの dir/attachments は使わない。送信・変更にはユーザーの明示的な依頼が必要。結果が不明なら再試行前にメールボックスを確認する。 read は本文と MIME を含むエンコード済みメールが 48 MiB を超えると拒否します。先に search が返す size を確認してください。 検索は1ページ最大20件。has_more=trueなら同じ条件とnext_page_tokenをpage_tokenとして続行。日時はreceived_atで厳密に判定し、日付のみはUTC+8。全文検索は漏れの可能性を明示。 全ページでcoverage_complete=trueかつhas_more=falseの場合のみ全件確認済みと判断してください。text_scope:metadataは復号済みの件名・送受信者のみを検索し、本文は読みません。"
     },
     "qq_mail_connect": {
       "description": "Cindy に安全に保存済みの IMAP/SMTP 認証コードで指定の QQ メールに接続します。imap.qq.com と smtp.qq.com を検証後、メールアドレスを保存します。認証コードは引数に渡さず、メールアドレスのみ指定してください。メールは送信しません。"

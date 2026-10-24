@@ -1,7 +1,7 @@
 {
   "name": "@cindy-official/qq-mail",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.12",
   "description": "Build-only dependencies for the Cindy QQ Mail plugin Node Worker.",
   "scripts": {
     "build": "esbuild src/entry.cjs --bundle --platform=node --format=cjs --target=node20 --outfile=node/worker.cjs --legal-comments=eof"

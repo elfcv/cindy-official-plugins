@@ -224,9 +224,9 @@ test('Worker 构造安全的搜索条件并保留 IMAP folder + UID 身份', () 
     from: 'alice@example.com',
     since: '2026-07-01',
   });
-  assert.equal(criteria.seen, false);
-  assert.equal(criteria.from, 'alice@example.com');
-  assert.equal(criteria.since instanceof Date, true);
+  assert.equal(criteria.seen, undefined, 'seen is filtered locally from fetched flags');
+  assert.equal(criteria.from, undefined, 'decoded addresses are filtered locally');
+  assert.equal(criteria.since, '2026-06-29', 'padded calendar day is sent to IMAP');
   assert.deepEqual(criteria.or, [
     { subject: 'project' },
     { from: 'project' },
@@ -488,3 +488,6 @@ test('Worker 将认证、网络与频控错误转换成可行动文案', () => {
 
 // Run the attachment boundary/MIME regressions in the official per-plugin CI job.
 import '../qq-mail/tests/attachments.test.cjs';
+
+// Exercise search pagination and coverage boundaries in the per-plugin CI job.
+import '../qq-mail/tests/search.test.cjs';

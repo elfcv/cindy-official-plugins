@@ -66115,6 +66115,8 @@ var require_worker = __commonJS({
     var MAX_ATTACHMENTS = 10;
     var MAX_BODY_CHARS = 2e4;
     var MAX_SOURCE_BYTES = 48 * 1024 * 1024;
+    var MAX_SEARCH_CANDIDATES = 1e4;
+    var METADATA_BATCH_SIZE = 200;
     var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     var SECRET_KEY = "qq_mail_authorization_code";
     function normalizeCredentials(value) {
@@ -66151,21 +66153,30 @@ var require_worker = __commonJS({
     }
     function parseSearchDate(value, field) {
       if (value === void 0) return void 0;
-      const date = new Date(value);
+      if (typeof value !== "string") throw new Error(`INVALID_${field.toUpperCase()}`);
+      const dayOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+      const calendar = /* @__PURE__ */ new Date(value.slice(0, 10) + "T00:00:00Z");
+      if (!Number.isFinite(calendar.getTime()) || calendar.toISOString().slice(0, 10) !== value.slice(0, 10)) {
+        throw new Error(`INVALID_${field.toUpperCase()}`);
+      }
+      if (!dayOnly && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
+        throw new Error(`INVALID_${field.toUpperCase()}`);
+      }
+      const date = new Date(dayOnly ? value + "T00:00:00+08:00" : value);
       if (Number.isNaN(date.getTime())) throw new Error(`INVALID_${field.toUpperCase()}`);
       return date;
     }
     function buildSearchCriteria(action) {
       const criteria = {};
-      if (typeof action.from === "string" && action.from.trim()) criteria.from = action.from.trim();
-      if (typeof action.to === "string" && action.to.trim()) criteria.to = action.to.trim();
-      if (typeof action.subject === "string" && action.subject.trim()) criteria.subject = action.subject.trim();
-      if (typeof action.unread === "boolean") criteria.seen = !action.unread;
       const since = parseSearchDate(action.since, "since");
       const before = parseSearchDate(action.before, "before");
-      if (since) criteria.since = since;
-      if (before) criteria.before = before;
-      if (typeof action.text === "string" && action.text.trim()) {
+      if (since && before && since >= before) throw new Error("INVALID_SEARCH_RANGE");
+      if (since) criteria.since = new Date(since.getTime() - 864e5).toISOString().slice(0, 10);
+      if (before) criteria.before = new Date(before.getTime() + 2 * 864e5).toISOString().slice(0, 10);
+      if (action.text_scope !== void 0 && !["metadata", "full"].includes(action.text_scope)) {
+        throw new Error("INVALID_TEXT_SCOPE");
+      }
+      if (action.text_scope !== "metadata" && typeof action.text === "string" && action.text.trim()) {
         const text = action.text.trim();
         criteria.or = [
           { subject: text },
@@ -66198,6 +66209,7 @@ var require_worker = __commonJS({
         to: addressText(envelope.to),
         subject: envelope.subject || "",
         date: envelope.date || message.internalDate || null ? new Date(envelope.date || message.internalDate).toISOString() : null,
+        received_at: message.internalDate ? new Date(message.internalDate).toISOString() : null,
         unread: !flags.includes("\\Seen"),
         flagged: flags.includes("\\Flagged"),
         size: Number.isFinite(message.size) ? message.size : null
@@ -66312,21 +66324,140 @@ var require_worker = __commonJS({
     }
     async function search(credentials, action, deps) {
       const folder = action.folder || "INBOX";
+      const criteria = buildSearchCriteria(action);
+      const since = parseSearchDate(action.since, "since");
+      const before = parseSearchDate(action.before, "before");
+      const fold = (value) => String(value || "").normalize("NFKC").toLowerCase();
+      const queryHash = createHash("sha256").update(JSON.stringify({
+        email: credentials.email.toLowerCase(),
+        folder,
+        since: since ? since.toISOString() : null,
+        before: before ? before.toISOString() : null,
+        from: fold(action.from).trim(),
+        to: fold(action.to).trim(),
+        subject: fold(action.subject).trim(),
+        unread: typeof action.unread === "boolean" ? action.unread : null,
+        text: typeof action.text === "string" ? action.text.trim() : "",
+        text_scope: action.text_scope || "full"
+      })).digest("hex");
+      let cursor;
+      if (action.page_token !== void 0) {
+        try {
+          if (typeof action.page_token !== "string" || !/^[A-Za-z0-9_-]{1,1024}$/.test(action.page_token)) throw new Error();
+          cursor = JSON.parse(Buffer.from(action.page_token, "base64url").toString("utf8"));
+          if (cursor.v !== 1 || cursor.q !== queryHash || typeof cursor.validity !== "string" || !Number.isInteger(cursor.high) || cursor.high < 1 || cursor.high > 4294967295 || !Number.isInteger(cursor.before) || cursor.before < 1 || cursor.before > cursor.high) throw new Error();
+        } catch (_error) {
+          throw new Error("INVALID_PAGE_TOKEN");
+        }
+      }
       const maxResults = Number.isInteger(action.max_results) ? Math.min(20, Math.max(1, action.max_results)) : 10;
       return withImap(credentials, deps, (client) => withMailbox(client, folder, async () => {
-        const uids = await client.search(buildSearchCriteria(action), { uid: true });
-        const selected = uids.slice(-maxResults).reverse();
-        if (selected.length === 0) return { folder, total: 0, messages: [] };
-        const messages = await client.fetchAll(
-          selected,
-          { uid: true, envelope: true, flags: true, internalDate: true, size: true },
-          { uid: true }
-        );
-        const byUid = new Map(messages.map((message) => [message.uid, message]));
+        const validity = client.mailbox && client.mailbox.uidValidity != null ? String(client.mailbox.uidValidity) : null;
+        if (cursor && cursor.validity !== validity) throw new Error("PAGE_TOKEN_MAILBOX_CHANGED");
+        const found = await client.search(criteria, { uid: true });
+        if (!Array.isArray(found)) throw new Error("SEARCH_UNAVAILABLE");
+        const candidates = [...new Set(found)].sort((a, b) => b - a);
+        if (candidates.some((uid) => !Number.isInteger(uid) || uid < 1 || uid > 4294967295)) throw new Error("SEARCH_UNAVAILABLE");
+        const high = cursor ? cursor.high : candidates[0] || 0;
+        const uids = candidates.filter((uid) => uid <= high);
+        const localScan = !!(since || before || typeof action.unread === "boolean" || ["from", "to", "subject"].some((key) => typeof action[key] === "string" && action[key].trim()) || action.text_scope === "metadata" && typeof action.text === "string" && action.text.trim());
+        const fullText = typeof action.text === "string" && action.text.trim() && action.text_scope !== "metadata";
+        if (!localScan) {
+          const remaining2 = cursor ? uids.filter((uid) => uid < cursor.before) : uids;
+          const selected = remaining2.slice(0, maxResults);
+          const fetched = selected.length ? await client.fetchAll(
+            selected,
+            { uid: true, envelope: true, flags: true, internalDate: true, size: true },
+            { uid: true }
+          ) : [];
+          const byUid2 = new Map(fetched.filter((message) => selected.includes(message.uid)).map((message) => [message.uid, message]));
+          const messages2 = selected.filter((uid) => byUid2.has(uid)).map((uid) => summaryFromMessage(byUid2.get(uid), folder));
+          const hasMore2 = remaining2.length > selected.length;
+          if (hasMore2 && validity === null) throw new Error("MAILBOX_STATE_UNAVAILABLE");
+          const next2 = hasMore2 ? Buffer.from(JSON.stringify({
+            v: 1,
+            q: queryHash,
+            validity,
+            high,
+            before: selected[selected.length - 1]
+          })).toString("base64url") : null;
+          return {
+            folder,
+            total: uids.length,
+            returned: messages2.length,
+            messages: messages2,
+            has_more: hasMore2,
+            next_page_token: next2,
+            coverage_complete: !fullText && byUid2.size === selected.length,
+            total_is_exact: !fullText && byUid2.size === selected.length,
+            server_candidate_total: uids.length,
+            metadata_scanned: byUid2.size,
+            missing_metadata_count: selected.length - byUid2.size,
+            missing_date_count: 0,
+            uid_validity: validity,
+            snapshot_max_uid: high,
+            date_basis: "received_at",
+            ...fullText ? { search_warning: "\u5168\u6587\u641C\u7D22\u4F9D\u8D56 QQ \u670D\u52A1\u5668\uFF0C\u53EF\u80FD\u6F0F\u641C\uFF1B\u5B8C\u6574\u68C0\u67E5\u8BF7\u4E0D\u4F20 text\uFF0C\u6216\u4F7F\u7528 text_scope:metadata \u53EA\u67E5\u6807\u9898\u548C\u5730\u5740\u3002" } : {}
+          };
+        }
+        if (uids.length > MAX_SEARCH_CANDIDATES) throw new Error("SEARCH_TOO_BROAD");
+        const byUid = /* @__PURE__ */ new Map();
+        for (let offset = 0; offset < uids.length; offset += METADATA_BATCH_SIZE) {
+          const batch = uids.slice(offset, offset + METADATA_BATCH_SIZE);
+          const fetched = await client.fetchAll(
+            batch,
+            { uid: true, envelope: true, flags: true, internalDate: true, size: true },
+            { uid: true }
+          );
+          for (const message of fetched) if (batch.includes(message.uid)) byUid.set(message.uid, message);
+        }
+        let missingDates = 0;
+        const summaries = uids.filter((uid) => byUid.has(uid)).map((uid) => summaryFromMessage(byUid.get(uid), folder));
+        const matches = summaries.filter((message) => {
+          if (since || before) {
+            const received = message.received_at && Date.parse(message.received_at);
+            if (!Number.isFinite(received)) {
+              missingDates++;
+              return false;
+            }
+            if (since && received < since.getTime() || before && received >= before.getTime()) return false;
+          }
+          for (const key of ["from", "to", "subject"]) {
+            if (typeof action[key] === "string" && action[key].trim() && !fold(message[key]).includes(fold(action[key]).trim())) return false;
+          }
+          if (typeof action.unread === "boolean" && message.unread !== action.unread) return false;
+          if (action.text_scope === "metadata" && typeof action.text === "string" && action.text.trim() && !["from", "to", "subject"].some((key) => fold(message[key]).includes(fold(action.text).trim()))) return false;
+          return true;
+        });
+        const remaining = cursor ? matches.filter((message) => message.uid < cursor.before) : matches;
+        const messages = remaining.slice(0, maxResults);
+        const hasMore = remaining.length > messages.length;
+        if (hasMore && validity === null) throw new Error("MAILBOX_STATE_UNAVAILABLE");
+        const next = hasMore ? Buffer.from(JSON.stringify({
+          v: 1,
+          q: queryHash,
+          validity,
+          high,
+          before: messages[messages.length - 1].uid
+        })).toString("base64url") : null;
+        const missingMetadata = uids.length - byUid.size;
         return {
           folder,
-          total: uids.length,
-          messages: selected.map((uid) => byUid.get(uid)).filter(Boolean).map((message) => summaryFromMessage(message, folder))
+          total: matches.length,
+          returned: messages.length,
+          messages,
+          has_more: hasMore,
+          next_page_token: next,
+          coverage_complete: !fullText && missingMetadata === 0 && missingDates === 0,
+          total_is_exact: !fullText && missingMetadata === 0 && missingDates === 0,
+          server_candidate_total: uids.length,
+          metadata_scanned: byUid.size,
+          missing_metadata_count: missingMetadata,
+          missing_date_count: missingDates,
+          uid_validity: validity,
+          snapshot_max_uid: high,
+          date_basis: "received_at",
+          ...fullText ? { search_warning: "\u5168\u6587\u641C\u7D22\u4F9D\u8D56 QQ \u670D\u52A1\u5668\uFF0C\u53EF\u80FD\u6F0F\u641C\uFF1B\u5B8C\u6574\u68C0\u67E5\u8BF7\u4E0D\u4F20 text\uFF0C\u6216\u4F7F\u7528 text_scope:metadata \u53EA\u67E5\u6807\u9898\u548C\u5730\u5740\u3002" } : {}
         };
       }));
     }
@@ -66598,6 +66729,11 @@ var require_worker = __commonJS({
       const code = error && error.code ? String(error.code) : "";
       const message = error && error.message ? String(error.message) : String(error || "");
       const combined = `${code} ${message}`.toLowerCase();
+      if (message === "SEARCH_TOO_BROAD") return "\u67E5\u8BE2\u8303\u56F4\u8FC7\u5927\uFF0C\u8D85\u8FC710000\u5C01\u5019\u9009\u90AE\u4EF6\uFF1B\u8BF7\u52A0\u4E0A\u6216\u7F29\u5C0Fsince/before\u65E5\u671F\u8303\u56F4\u540E\u91CD\u8BD5\uFF0C\u5C1A\u672A\u5B8C\u6210\u8986\u76D6";
+      if (message === "INVALID_PAGE_TOKEN") return "\u7FFB\u9875\u6807\u8BB0\u65E0\u6548\u6216\u4E0E\u90AE\u7BB1\u3001\u6587\u4EF6\u5939\u3001\u7B5B\u9009\u6761\u4EF6\u4E0D\u4E00\u81F4\uFF1B\u8BF7\u4FDD\u6301\u539F\u6761\u4EF6\u7EE7\u7EED\uFF0C\u6216\u91CD\u65B0\u67E5\u8BE2\u7B2C\u4E00\u9875";
+      if (message === "PAGE_TOKEN_MAILBOX_CHANGED") return "\u90AE\u7BB1UID\u6709\u6548\u671F\u5DF2\u53D8\u5316\uFF0C\u65E7\u7FFB\u9875\u6807\u8BB0\u4E0D\u53EF\u7EE7\u7EED\uFF1B\u8BF7\u91CD\u65B0\u67E5\u8BE2\u7B2C\u4E00\u9875";
+      if (message === "MAILBOX_STATE_UNAVAILABLE" || message === "SEARCH_UNAVAILABLE") return "\u65E0\u6CD5\u786E\u8BA4\u5B8C\u6574\u67E5\u8BE2\u6216\u7FFB\u9875\u72B6\u6001\uFF1B\u672C\u6B21\u68C0\u67E5\u672A\u5B8C\u6210\uFF0C\u4E0D\u80FD\u89C6\u4E3A\u6CA1\u6709\u90AE\u4EF6";
+      if (/^INVALID_(SINCE|BEFORE|SEARCH_RANGE|TEXT_SCOPE)$/.test(message)) return "\u67E5\u8BE2\u53C2\u6570\u65E0\u6548\uFF1A\u65E5\u671F\u7528YYYY-MM-DD\uFF08UTC+8\uFF09\u6216\u5E26\u65F6\u533A\u7684ISO\u65F6\u95F4\uFF0Csince\u5FC5\u987B\u65E9\u4E8Ebefore\uFF1Btext_scope\u4E3Ametadata\u6216full";
       if (message === "INVALID_ATTACHMENT_PATHS") return "\u9644\u4EF6\u987B\u4F7F\u7528\u672C\u673A\u6587\u4EF6\u7EDD\u5BF9\u8DEF\u5F84\u5217\u8868\uFF0C\u6BCF\u5C01\u6700\u591A 10 \u4E2A\u6587\u4EF6";
       if (message === "ATTACHMENT_UNREADABLE" || message === "ATTACHMENT_NOT_FILE") return "\u9644\u4EF6\u4E0D\u5B58\u5728\u3001\u65E0\u6CD5\u8BFB\u53D6\u6216\u4E0D\u662F\u666E\u901A\u6587\u4EF6\uFF1B\u90AE\u4EF6\u672A\u53D1\u9001\uFF0C\u8BF7\u68C0\u67E5\u6587\u4EF6\u8DEF\u5F84";
       if (message === "ATTACHMENTS_TOO_LARGE") return "\u9644\u4EF6\u603B\u5927\u5C0F\u8D85\u8FC7 32 MiB\uFF1B\u90AE\u4EF6\u672A\u53D1\u9001\uFF0C\u8BF7\u7F29\u5C0F\u9644\u4EF6\u540E\u91CD\u8BD5";

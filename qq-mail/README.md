@@ -103,3 +103,22 @@ write followed by confirmation/cleanup failure, `executed`. Unknown and executed
 failures require checking the mailbox before another write. The 0.2.11 package
 has not yet completed Cindy device verification; earlier device results above
 apply to earlier package contents.
+
+## Search pagination and exact time windows (0.2.12)
+
+- Each page is still at most 20 messages. Repeat the **same folder and filters**, adding `page_token` from `next_page_token`, until `has_more` is false. Check `coverage_complete` on **every page** and deduplicate by email + folder + UID. `total` is the match count in the current UID snapshot, not just this page's size. Newer arrivals do not shift later pages; deletion/flag changes can still change totals. UIDVALIDITY or a changed account/query invalidates the token. Tokens are navigation data, not credentials or authorization.
+- `since` includes its boundary and `before` excludes it. Date-only strings mean midnight in UTC+8; timestamps require an explicit offset or `Z`. Filtering uses the **received timestamp** (`received_at`, IMAP INTERNALDATE). The existing `date` field is the sender's Date header for display; the two may differ. This aligns daily checks with Gmail internal/received dates.
+- IMAP day queries are padded and sent as day strings; metadata is then filtered locally at exact boundaries. `from`, `to`, `subject`, unread and `text_scope:metadata` are applied to decoded metadata before counting and pagination, avoiding QQ header-search false negatives without opening unrelated bodies.
+- Default `text_scope:full` preserves server-side full-text behavior, but explicitly returns `coverage_complete:false`, `total_is_exact:false` and a warning because QQ server keyword misses cannot be ruled out. Use no keyword for complete daily checks. `text_scope:metadata` searches only decoded subject/from/to, not body or attachments.
+- A filtered request scans at most 10,000 candidate metadata records in batches of 200. Broader requests fail explicitly and require a smaller date range. Unfiltered latest-mail requests fetch only the current page. Missing metadata, or receipt dates required by a time filter, mark coverage incomplete; they never become a clean no-mail result.
+- Search only fetches envelope, flags, INTERNALDATE and size. It does not set Seen, download bodies, fetch credentials or change labels. Existing account/secret injection and write behavior are unchanged. No new Host permission is declared.
+
+Example first page (read-only):
+
+```json
+{"action":"search","folder":"INBOX","since":"2026-10-23T00:00:00+08:00","before":"2026-10-24T00:00:00+08:00","max_results":20}
+```
+
+The next request repeats these fields and adds `page_token` equal to the returned `next_page_token`; omit the token for a new first page.
+
+Validation: `node --test tests/search.test.cjs tests/attachments.test.cjs`; build: `npm run build`. Regression fixtures include 36-message pagination, 28 unread messages, arrivals/deletions between pages, UIDVALIDITY and account/query changes, UTC+8 endpoints, AM/PM splitting, Unicode/case-insensitive headers, explicit full-text limitations, scan bounds and the real ImapFlow search compiler. Fixtures are synthetic; they do not establish completeness of a particular live mailbox. Runtime verification evidence and its applicability to the submitted package belong in the PR.

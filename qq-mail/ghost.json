@@ -4,7 +4,7 @@
   "name": "QQ 邮箱",
   "description": "通过 QQ 邮箱 IMAP/SMTP 搜索、阅读、整理邮件，并创建草稿或发送邮件。授权码由 Cindy 安全保存，仅在执行邮箱请求时临时提供给插件 Worker。",
   "whenToUse": "需要查找、阅读或整理 QQ 邮箱邮件，以及创建草稿或发送邮件时使用。首次使用前请在插件详情页输入 QQ 邮箱地址和 IMAP/SMTP 授权码并完成连接测试。",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "locales": {
     "en": "locales/en.json",
     "zh-CN": "locales/zh-CN.json",
@@ -41,7 +41,7 @@
     },
     {
       "name": "qq_mail",
-      "description": "执行 QQ 邮箱 IMAP/SMTP 查询及邮件操作。send/draft 的 attachment_paths 仅接收明确授权的本机绝对路径，最多 10 个、合计 32 MiB；Worker 读取指定普通文件，经 smtp.qq.com 发送或 imap.qq.com 保存草稿，不修改源文件。send/draft/read 返回附件名称、字节数与 SHA-256；read 不下载附件。勿用顶层 dir/attachments。发送与修改须有用户明确要求；结果不确定时先核对邮箱，禁止盲目重试。 read 拒绝超过 48 MiB 的编码邮件（含正文和 MIME）；先检查 search 返回的 size。",
+      "description": "执行 QQ 邮箱 IMAP/SMTP 查询及邮件操作。send/draft 的 attachment_paths 仅接收明确授权的本机绝对路径，最多 10 个、合计 32 MiB；Worker 读取指定普通文件，经 smtp.qq.com 发送或 imap.qq.com 保存草稿，不修改源文件。send/draft/read 返回附件名称、字节数与 SHA-256；read 不下载附件。勿用顶层 dir/attachments。发送与修改须有用户明确要求；结果不确定时先核对邮箱，禁止盲目重试。 read 拒绝超过 48 MiB 的编码邮件（含正文和 MIME）；先检查 search 返回的 size。 search按received_at收信时间筛选（since含、before不含）；每批最多20封，has_more=true时用next_page_token作为page_token并保持原筛选继续。只有coverage_complete=true且翻页结束才可称查全。标题/地址在本地元数据筛选；全文可能漏搜，text_scope:metadata只查标题/地址。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -72,14 +72,14 @@
           },
           "text": {
             "type": "string",
-            "description": "search 的全文关键词，可省略。"
+            "description": "search关键词；默认full由QQ服务器查正文等（可能漏搜）；text_scope:metadata时本地查标题/发件人/收件人，不读正文。"
           },
           "from": {
             "type": "string",
-            "description": "search 的发件人关键词。"
+            "description": "search发件人名称/地址子串，本地解码元数据不区分大小写筛选。建议同时限定since/before。"
           },
           "to": {
-            "description": "search 时是收件人关键词；send/draft 时是收件人地址，可传逗号分隔字符串或字符串数组。"
+            "description": "search为收件人名称/地址字符串子串，本地元数据筛选；send/draft可传逗号分隔字符串或字符串数组。"
           },
           "cc": {
             "description": "send/draft 的抄送地址，可传逗号分隔字符串或字符串数组。"
@@ -101,15 +101,17 @@
           },
           "since": {
             "type": "string",
-            "description": "search 起始日期，ISO 日期或日期时间。"
+            "description": "search收信时间起点（含）。YYYY-MM-DD按Asia/Shanghai UTC+8零点解释；或传带Z/±HH:MM时区的完整ISO时间。精确到时刻，在元数据本地过滤。"
           },
           "before": {
             "type": "string",
-            "description": "search 截止日期，ISO 日期或日期时间。"
+            "description": "search收信时间终点（不含），格式同since；YYYY-MM-DD按UTC+8零点解释。"
           },
           "max_results": {
             "type": "integer",
-            "description": "search 返回条数，默认 10，最大 20。"
+            "description": "search每页条数，默认10，最大20；翻页使用page_token，不能只读第一页。",
+            "minimum": 1,
+            "maximum": 20
           },
           "attachment_paths": {
             "type": "array",
@@ -118,6 +120,20 @@
               "type": "string"
             },
             "description": "send/draft 的附件绝对路径列表，文件必须位于运行 Cindy 的电脑上；最多 10 个、合计 32 MiB，仅使用用户明确授权发送的文件。不传文件字节或 URL。"
+          },
+          "page_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": "search续页标记。取上一页next_page_token；保持原邮箱、folder和所有筛选条件。不要自行构造；首次查询省略。"
+          },
+          "text_scope": {
+            "type": "string",
+            "enum": [
+              "full",
+              "metadata"
+            ],
+            "description": "search的text范围，默认full兼容正文全文搜索（QQ服务器可能漏搜，会标明coverage_complete=false）；metadata只查已解码标题/发件人/收件人，本地筛选且不读正文。完整日期检查应省略text。"
           }
         },
         "required": [
