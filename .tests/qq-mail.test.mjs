@@ -224,7 +224,7 @@ test('Worker 构造安全的搜索条件并保留 IMAP folder + UID 身份', () 
     from: 'alice@example.com',
     since: '2026-07-01',
   });
-  assert.equal(criteria.seen, undefined, 'seen is filtered locally from fetched flags');
+  assert.equal(criteria.seen, false, 'server flag prefilter is also verified locally');
   assert.equal(criteria.from, undefined, 'decoded addresses are filtered locally');
   assert.equal(criteria.since, '2026-06-29', 'padded calendar day is sent to IMAP');
   assert.deepEqual(criteria.or, [

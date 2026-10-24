@@ -18,7 +18,10 @@ function fixture(rows, options = {}) {
     getMailboxLock: async () => ({ release() { state.released++; } }),
     search: async (query, opts) => { state.queries.push(query); assert.deepEqual(opts, { uid: true });
       assert.equal(query.from, undefined); assert.equal(query.to, undefined); assert.equal(query.subject, undefined);
-      assert.equal(query.seen, undefined);
+      assert.equal(query.seen === undefined || typeof query.seen === 'boolean', true);
+      if (options.serverSeenFilter && typeof query.seen === 'boolean') {
+        return state.rows.filter(row => row.flags.has('\\Seen') === query.seen).map(row => row.uid);
+      }
       return options.found || state.rows.map(row => row.uid).reverse(); },
     fetchAll: async (uids, query, opts) => { state.fetches.push(uids); assert.deepEqual(opts, { uid: true });
       assert.deepEqual(query, { uid: true, envelope: true, flags: true, internalDate: true, size: true });
@@ -40,6 +43,20 @@ test('28 unread messages are available across two pages without changing flags',
   const b = await f.run({ ...day, unread: true, page_token: a.next_page_token });
   assert.deepEqual([a.total, a.returned, b.returned, b.has_more], [28, 20, 8, false]);
   assert.equal(f.state.rows.filter(row => row.flags.has('\\Seen')).length, 8);
+  assert.equal(f.state.queries[0].seen, false);
+});
+test('undated unread search prefilters flags in a mailbox larger than the scan cap', async () => {
+  const f = fixture(Array.from({ length: 10025 }, (_, i) => mail(i + 1,
+    { flags: new Set(i < 10000 ? ['\\Seen'] : []) })), { serverSeenFilter: true });
+  const query = { action: 'search', unread: true, max_results: 20 };
+  const a = await f.run(query); const b = await f.run({ ...query, page_token: a.next_page_token });
+  assert.deepEqual([a.total, a.returned, b.returned, b.has_more], [25, 20, 5, false]);
+  assert.equal(a.coverage_complete, true); assert.equal(b.coverage_complete, true);
+  assert.equal(f.state.queries[0].seen, false);
+  assert.equal(f.state.fetches.flat().some(uid => uid <= 10000), false);
+  const seen = await f.run({ action: 'search', unread: false, max_results: 20 });
+  assert.equal(f.state.queries.at(-1).seen, true); assert.equal(seen.total, 10000);
+  assert.equal(f.state.rows.filter(row => row.flags.has('\\Seen')).length, 10000);
 });
 test('new arrivals do not shift or duplicate the next page', async () => {
   const f = fixture(Array.from({ length: 36 }, (_, i) => mail(i + 1)));

@@ -66168,6 +66168,7 @@ var require_worker = __commonJS({
     }
     function buildSearchCriteria(action) {
       const criteria = {};
+      if (typeof action.unread === "boolean") criteria.seen = !action.unread;
       const since = parseSearchDate(action.since, "since");
       const before = parseSearchDate(action.before, "before");
       if (since && before && since >= before) throw new Error("INVALID_SEARCH_RANGE");

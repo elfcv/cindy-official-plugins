@@ -89,7 +89,9 @@ function parseSearchDate(value, field) {
 function buildSearchCriteria(action) {
   const criteria = {};
   // QQ's header search can miss known matches. Fetch only metadata and apply
-  // from/to/subject/seen locally, before counting and paginating the results.
+  // from/to/subject locally, before counting and paginating the results.
+  // Flag search is reliable IMAP state: prefilter it, then verify locally too.
+  if (typeof action.unread === 'boolean') criteria.seen = !action.unread;
   const since = parseSearchDate(action.since, 'since');
   const before = parseSearchDate(action.before, 'before');
   if (since && before && since >= before) throw new Error('INVALID_SEARCH_RANGE');
