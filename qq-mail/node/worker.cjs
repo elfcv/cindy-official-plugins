@@ -66200,17 +66200,23 @@ var require_worker = __commonJS({
     function flagsArray(flags) {
       return flags && typeof flags[Symbol.iterator] === "function" ? Array.from(flags) : [];
     }
+    function isoDateOrNull(value) {
+      if (value === void 0 || value === null || value === "") return null;
+      const date = new Date(value);
+      return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+    }
     function summaryFromMessage(message, folder) {
       const envelope = message.envelope || {};
       const flags = flagsArray(message.flags);
+      const receivedAt = isoDateOrNull(message.internalDate);
       return {
         uid: message.uid,
         folder,
         from: addressText(envelope.from),
         to: addressText(envelope.to),
         subject: envelope.subject || "",
-        date: envelope.date || message.internalDate || null ? new Date(envelope.date || message.internalDate).toISOString() : null,
-        received_at: message.internalDate ? new Date(message.internalDate).toISOString() : null,
+        date: isoDateOrNull(envelope.date) || receivedAt,
+        received_at: receivedAt,
         unread: !flags.includes("\\Seen"),
         flagged: flags.includes("\\Flagged"),
         size: Number.isFinite(message.size) ? message.size : null

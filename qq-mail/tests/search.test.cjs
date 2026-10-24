@@ -119,6 +119,18 @@ test('metadata fetch omissions and absent received dates never look complete', a
   const b = await fixture([mail(1, { internalDate: undefined })]).run();
   assert.equal(b.coverage_complete, false); assert.equal(b.missing_date_count, 1);
 });
+test('malformed INTERNALDATE leaves the rest of a date-filtered page usable but incomplete', async () => {
+  const f = fixture([mail(1), mail(2, { internalDate: 'unparseable INTERNALDATE' }),
+    mail(3, { internalDate: new Date(NaN), envelope: { date: 'invalid Date header' } })]);
+  const a = await f.run();
+  assert.deepEqual(a.messages.map(m => m.uid), [1]);
+  assert.equal(a.missing_date_count, 2); assert.equal(a.coverage_complete, false);
+  assert.equal(a.total_is_exact, false);
+  const latest = await f.run({ action: 'search', max_results: 20 });
+  assert.equal(latest.messages.find(m => m.uid === 2).received_at, null);
+  assert.equal(latest.messages.find(m => m.uid === 2).date, '2026-10-23T00:00:00.000Z');
+  assert.equal(latest.messages.find(m => m.uid === 3).date, null);
+});
 test('bounded metadata scan refuses excess coverage; latest mail remains cheap', async () => {
   const found = Array.from({ length: 10001 }, (_, i) => i + 1);
   const f = fixture([mail(10001)], { found });
